@@ -1,0 +1,100 @@
+name: casaguard
+
+services:
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:0.16.4
+    container_name: casaguard-frigate
+    restart: unless-stopped
+    shm_size: "128mb"
+    devices:
+      - /dev/video0:/dev/video0
+    ports:
+      - "${FRIGATE_PORT:-5000}:5000"
+      - "8554:8554"       # RTSP restream (LAN only; firewall if exposed)
+      - "8555:8555/tcp"   # WebRTC
+      - "8555:8555/udp"   # WebRTC
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+      LIBVA_DRIVER_NAME: "" # Explicitly disable GPU/video acceleration
+    volumes:
+      - ./frigate/config.yml:/config/config.yml:ro
+      - frigate-config:/config
+      - frigate-media:/media/frigate
+      - type: tmpfs
+        target: /tmp/cache
+        tmpfs:
+          size: 134217728
+    mem_limit: 1536m
+    cpus: 2.0
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -T 5 -O /dev/null http://127.0.0.1:5000/api/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    security_opt:
+      - no-new-privileges:true
+
+  codeproject-ai:
+    image: codeproject/ai-server:2.9.5
+    container_name: casaguard-codeproject-ai
+    restart: unless-stopped
+    ports:
+      - "${CPAI_PORT:-32168}:32168"
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+      # CPU-only host: keep modules conservative. Install Face Processing and
+      # Sound Classifier from the dashboard; their downloads persist below.
+      CPAI_APPROOTPATH: /app
+    volumes:
+      - codeproject-data:/etc/codeproject/ai
+      - codeproject-modules:/app/modules
+      - ./models:/app/modules/ObjectDetectionYolo/custom-models:ro
+    mem_limit: 1024m
+    cpus: 1.5
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -T 5 -O /dev/null http://127.0.0.1:32168/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    security_opt:
+      - no-new-privileges:true
+
+  webhook-relay:
+    build:
+      context: ./webhook-relay
+    image: casaguard/webhook-relay:local
+    container_name: casaguard-webhook-relay
+    restart: unless-stopped
+    depends_on:
+      frigate:
+        condition: service_healthy
+    environment:
+      FRIGATE_URL: http://frigate:5000
+      FRIGATE_PUBLIC_URL: ${FRIGATE_PUBLIC_URL:-http://frigate:5000}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      WEBHOOK_TOKEN: ${WEBHOOK_TOKEN:-}
+      POLL_SECONDS: ${WEBHOOK_POLL_SECONDS:-10}
+      TZ: ${TZ:-Etc/UTC}
+    volumes:
+      - webhook-relay-state:/state
+    mem_limit: 96m
+    cpus: 0.25
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  frigate-config:
+    name: casaguard_frigate_config
+  frigate-media:
+    name: casaguard_frigate_media
+  codeproject-data:
+    name: casaguard_codeproject_data
+  codeproject-modules:
+    name: casaguard_codeproject_modules
+  webhook-relay-state:
+    name: casaguard_webhook_relay_state

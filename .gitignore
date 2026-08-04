@@ -1,0 +1,8 @@
+.env
+frigate/*.db
+frigate/*.db-*
+frigate/notifications.pem
+models/*
+!models/.gitkeep
+__pycache__/
+*.py[cod]
