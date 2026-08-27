@@ -7,16 +7,23 @@ SCAN = int(os.getenv('SCAN_SECONDS','30')); LOCK = threading.Lock()
 
 def best_mode(text):
     """Return the highest resolution and its highest valid advertised FPS."""
-    candidates=[]; size=None
+    candidates=[]; size=None; pixel_format='mjpeg'
+    formats={'H264':'h264','MJPG':'mjpeg','HEVC':'hevc','YUYV':'yuyv422','NV12':'nv12'}
     for line in text.splitlines():
+        match=re.search(r"\[\d+\]:\s+'([^']+)'",line)
+        if match:
+            pixel_format=formats.get(match.group(1),match.group(1).lower())
+            size=None
+            continue
         match=re.search(r'Size:\s+Discrete\s+(\d+)x(\d+)',line)
         if match:
             size=(int(match.group(1)),int(match.group(2)))
             continue
         match=re.search(r'Interval:\s+Discrete.*\((\d+(?:\.\d+)?)\s+fps\)',line)
-        if size and match: candidates.append((size[0],size[1],float(match.group(1))))
-    if not candidates: return 640,480,5
-    return max(candidates,key=lambda mode:(mode[0]*mode[1],mode[2]))
+        if size and match: candidates.append((size[0],size[1],float(match.group(1)),pixel_format))
+    if not candidates: return 640,480,5,'mjpeg'
+    priority={'h264':3,'mjpeg':2,'hevc':1,'nv12':0,'yuyv422':0}
+    return max(candidates,key=lambda mode:(mode[0]*mode[1],priority.get(mode[3],0),mode[2]))
 
 def usb_devices():
     out=[]
@@ -35,8 +42,8 @@ def usb_devices():
             info=subprocess.check_output(['v4l2-ctl','--device',str(p),'--all'],stderr=subprocess.DEVNULL,text=True,timeout=3)
             if 'Driver name' in info:
                 modes=subprocess.check_output(['v4l2-ctl','--device',str(p),'--list-formats-ext'],stderr=subprocess.DEVNULL,text=True,timeout=3)
-                width,height,rate=best_mode(modes)
-                out.append({'id':p.name,'kind':'usb','path':str(p),'name':p.name,'enabled':True,'status':'available','width':width,'height':height,'fps':rate})
+                width,height,rate,input_format=best_mode(modes)
+                out.append({'id':p.name,'kind':'usb','path':str(p),'name':p.name,'enabled':True,'status':'available','width':width,'height':height,'fps':rate,'input_format':input_format})
         except Exception: pass
     return out
 
@@ -55,7 +62,9 @@ def render(cams):
             # Capture at the camera's advertised native mode, then provide H.264
             # for Frigate's MSE/WebRTC live player instead of MJPEG fallback.
             if cam.get('kind')=='usb':
-                source=f'ffmpeg:device?video={cam["path"]}&video_size={cam.get("width",640)}x{cam.get("height",480)}&framerate={cam.get("fps",5)}#video=h264'
+                input_format=cam.get('input_format','mjpeg')
+                output='copy' if input_format=='h264' else 'h264'
+                source=f'ffmpeg:device?video={cam["path"]}&input_format={input_format}&video_size={cam.get("width",640)}x{cam.get("height",480)}&framerate={cam.get("fps",5)}#video={output}'
             else:
                 source=f'ffmpeg:{cam["path"]}#video=h264'
             lines += [f'    {name}:',f'      - {json.dumps(source)}']
