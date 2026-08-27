@@ -7,8 +7,6 @@ mqtt:
 ffmpeg:
   global_args: -hide_banner -loglevel warning -threads 2
   hwaccel_args: "" # AMD Ryzen host: intentionally software decode only
-  output_args:
-    record: preset-record-mjpeg
 
 detectors:
   cpu1:
@@ -20,7 +18,7 @@ go2rtc:
     room:
       # Frigate's supported webcam path: go2rtc owns /dev/video0 and restreams it.
       # If camera-test.sh reports a different supported format, adjust this line.
-      - "ffmpeg:device?video=0&video_size=640x480&framerate=5#video=mjpeg"
+      - "ffmpeg:device?video=/dev/video0&video_size=640x480&framerate=5#video=h264"
 
 cameras:
   room:
