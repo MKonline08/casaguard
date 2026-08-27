@@ -7,7 +7,17 @@ SCAN = int(os.getenv('SCAN_SECONDS','30')); LOCK = threading.Lock()
 
 def usb_devices():
     out=[]
-    for p in sorted(Path('/dev').glob('video*')):
+    nodes=[]
+    try:
+        listing=subprocess.check_output(['v4l2-ctl','--list-devices'],text=True,timeout=5)
+        groups=[]
+        for line in listing.splitlines():
+            if line and not line[0].isspace(): groups.append([])
+            elif '/dev/video' in line and groups: groups[-1].append(line.strip())
+        nodes=[g[0] for g in groups if g]
+    except Exception: nodes=[str(p) for p in sorted(Path('/dev').glob('video*'))]
+    for node in nodes:
+        p=Path(node)
         try:
             info=subprocess.check_output(['v4l2-ctl','--device',str(p),'--all'],stderr=subprocess.DEVNULL,text=True,timeout=3)
             if 'Driver name' in info:
@@ -45,6 +55,9 @@ def render(cams):
 
 def scan():
     cams=load(); found=usb_devices()
+    valid={d['path'] for d in found}
+    for k,v in list(cams.items()):
+        if v.get('kind')=='usb' and v.get('path') not in valid: cams.pop(k,None)
     for d in found: cams.setdefault(d['id'],d).update(d)
     for k,v in list(cams.items()):
         if v.get('kind')=='usb' and not Path(v['path']).exists(): v['status']='offline'
