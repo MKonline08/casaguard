@@ -6,8 +6,7 @@ services:
     container_name: casaguard-frigate
     restart: unless-stopped
     shm_size: "128mb"
-    devices:
-      - /dev:/dev
+    privileged: true
     ports:
       - "${FRIGATE_PORT:-5000}:5000"
       - "8554:8554"       # RTSP restream (LAN only; firewall if exposed)
@@ -47,7 +46,6 @@ services:
     volumes:
       - ./frigate:/frigate
       - camera-manager-state:/state
-      - /dev:/dev
     depends_on:
       frigate:
         condition: service_started
