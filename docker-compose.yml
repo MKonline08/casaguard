@@ -12,7 +12,6 @@ services:
       - "8554:8554"       # RTSP restream (LAN only; firewall if exposed)
       - "8555:8555/tcp"   # WebRTC
       - "8555:8555/udp"   # WebRTC
-      - "1984:1984"       # go2rtc diagnostics (LAN only)
     environment:
       TZ: ${TZ:-Etc/UTC}
       LIBVA_DRIVER_NAME: "" # Explicitly disable GPU/video acceleration
