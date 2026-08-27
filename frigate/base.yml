@@ -1,4 +1,6 @@
 # Stable settings. Camera entries are generated in config.yml.
+version: 0.16-0
+
 mqtt:
   enabled: false
 

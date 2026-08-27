@@ -1,6 +1,7 @@
 import unittest
+from unittest.mock import patch
 
-from manager import best_mode, parse_v4l2_groups, public_state, render
+from manager import best_mode, is_capture_node, parse_v4l2_groups, public_state, render
 
 
 class BestModeTests(unittest.TestCase):
@@ -78,6 +79,15 @@ GENERAL WEBCAM (usb-b):
     def test_credentials_are_redacted_from_api_state(self):
         state=public_state({'front':{'path':'rtsp://admin:secret@192.168.1.20/live'}})
         self.assertEqual('rtsp://***:***@192.168.1.20/live',state['front']['path'])
+
+    @patch('manager.run', return_value="Format Video Capture:\n Width/Height : 1920/1080")
+    def test_capture_node_uses_video_format_ioctl(self, mocked_run):
+        self.assertTrue(is_capture_node('/dev/video0'))
+        mocked_run.assert_called_once_with(['v4l2-ctl','--device','/dev/video0','--get-fmt-video'],5)
+
+    @patch('manager.run', side_effect=RuntimeError('not a capture node'))
+    def test_metadata_node_is_rejected(self, _):
+        self.assertFalse(is_capture_node('/dev/video1'))
 
 
 if __name__ == '__main__':

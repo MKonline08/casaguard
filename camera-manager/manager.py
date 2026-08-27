@@ -31,9 +31,10 @@ def parse_v4l2_groups(text):
     return [group for group in groups if group['nodes']]
 
 def is_capture_node(path):
-    try: info=run(['v4l2-ctl','--device',path,'--all'],5)
+    try:
+        info=run(['v4l2-ctl','--device',path,'--get-fmt-video'],5)
     except Exception: return False
-    return 'Video Capture' in info and 'Metadata Capture' not in info
+    return 'Width/Height' in info or 'Pixel Format' in info
 
 def discover_usb():
     try: groups=parse_v4l2_groups(run(['v4l2-ctl','--list-devices'],5))
