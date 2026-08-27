@@ -5,7 +5,7 @@ services:
     image: ghcr.io/blakeblackshear/frigate:0.16.4
     container_name: casaguard-frigate
     restart: unless-stopped
-    shm_size: "256mb"
+    shm_size: "512mb"
     privileged: true
     ports:
       - "${FRIGATE_PORT:-5000}:5000"
@@ -23,8 +23,8 @@ services:
         target: /tmp/cache
         tmpfs:
           size: 134217728
-    mem_limit: 1536m
-    cpus: 2.0
+    mem_limit: 3072m
+    cpus: 4.0
     healthcheck:
       test: ["CMD-SHELL", "wget -q -T 5 -O /dev/null http://127.0.0.1:5000/api/version"]
       interval: 30s
@@ -40,11 +40,10 @@ services:
     build: ./camera-manager
     container_name: casaguard-camera-manager
     restart: unless-stopped
-    ports:
-      - "${CAMERA_MANAGER_PORT:-8971}:8971"
+    network_mode: host
     environment:
       TZ: ${TZ:-Etc/UTC}
-      FRIGATE_URL: http://frigate:5000
+      FRIGATE_URL: http://127.0.0.1:${FRIGATE_PORT:-5000}
       SCAN_SECONDS: ${CAMERA_SCAN_SECONDS:-30}
     volumes:
       - ./frigate:/frigate

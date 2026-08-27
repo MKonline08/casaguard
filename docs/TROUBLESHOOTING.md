@@ -8,7 +8,7 @@ v4l2-ctl --list-devices
 ./scripts/camera-test.sh /dev/video0
 ```
 
-If `/dev/video0` is missing, unplug/reconnect the webcam and inspect the `v4l2-ctl` output. A different camera may be `/dev/video2`; update both the `devices` entry in `docker-compose.yml` and `video=0` in `frigate/config.yml` together. In the latter, `video=2` corresponds to `/dev/video2`.
+If a USB camera is missing, unplug/reconnect it, run `v4l2-ctl --list-devices`, then trigger a scan at `http://YOUR-CASAOS-IP:8971`. Do not manually add duplicate `/dev/video*` nodes; the manager selects one capture node per physical camera.
 
 If the device exists but the test fails, choose a listed format/resolution that the webcam actually supports. Lower the Frigate stream to `320x240` / 5 fps first, verify a picture, then increase it. Add the CasaOS user to the `video` group if host-level access is denied:
 
@@ -30,7 +30,7 @@ Common fixes:
 
 - Run `scripts/camera-test.sh` again. Frigate cannot fix a host capture failure.
 - Stop every other program using the webcam (browser, Zoom, Cheese, etc.).
-- Ensure CasaOS has preserved the `/dev/video0:/dev/video0` device mapping.
+- Confirm `casaguard-camera-manager` is healthy and privileged device access is allowed by CasaOS.
 - For webcams that only output MJPEG, leave `#video=mjpeg` in the go2rtc line. For a camera whose test reports H.264, use `#video=h264` instead.
 
 After changing configuration, validate by restarting Frigate:

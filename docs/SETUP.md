@@ -1,16 +1,16 @@
 # ⚡ CasaGuard setup
 
-CasaGuard is a local, single-room deployment for a CasaOS host with a V4L2-compatible USB webcam. It never needs an MQTT broker.
+CasaGuard is a local multi-camera deployment for CasaOS. It discovers V4L2 USB cameras and ONVIF network cameras, and accepts validated RTSP/HTTP stream URLs.
 
 ## Before you start
 
 - A 64-bit Linux machine running CasaOS and Docker Compose v2
-- A Logitech USB webcam connected before the stack starts
+- Any supported USB webcam, or an ONVIF/RTSP network camera
 - At least 100 GB free storage if you intend to keep the configured seven-day continuous recording window
 - A modern two-core-or-better CPU; the included profile targets an AMD Ryzen laptop with 8 GB RAM and no GPU
 
 > [!IMPORTANT]
-> USB webcam device numbers can change after a reboot. Confirm `/dev/video0` every time the camera is moved or replaced.
+> CasaGuard groups the video nodes exposed by each physical webcam and tracks the camera independently of duplicate metadata nodes.
 
 ## Option A — CasaOS Custom App
 
@@ -19,7 +19,7 @@ CasaGuard is a local, single-room deployment for a CasaOS host with a V4L2-compa
 3. Run `./scripts/camera-test.sh`. It must capture a frame at 640×480 before you continue.
 4. In CasaOS, select **App Store** → **Custom Install** → **Import** and choose **Docker Compose**.
 5. Paste the complete contents of `docker-compose.yml` and select **Submit**.
-6. In CasaOS’s app editor, ensure the Frigate device mapping is `/dev/video0:/dev/video0`. CasaOS must allow that host device.
+6. Open `http://YOUR-CASAOS-IP:8971` to review discovered cameras or add an authenticated RTSP URL.
 7. Start the app. Go to `http://CASAOS-IP:5000` and set the Frigate account password when prompted.
 8. Go to `http://CASAOS-IP:32168` and verify CodeProject.AI reports healthy.
 
@@ -35,7 +35,7 @@ chmod +x scripts/*.sh
 ./scripts/install.sh
 ```
 
-The script checks Linux/Docker, requires `/dev/video0`, tests the camera, pulls the two published CPU images, builds the tiny local webhook relay, and starts the stack.
+The script checks Linux/Docker, tests all connected USB cameras, pulls the published images, builds the local services, and starts the stack even when no camera is attached yet.
 
 ## Manual Docker Compose steps
 
@@ -70,6 +70,7 @@ Do **not** run `docker compose down -v` unless you intentionally want to delete 
 | Port | Container | Purpose | Exposure recommendation |
 |---:|---|---|---|
 | `5000` | Frigate | UI and REST API | LAN only |
+| `8971` | Camera manager | USB/ONVIF discovery and RTSP setup | LAN only |
 | `8554` | Frigate/go2rtc | RTSP restream | LAN only; firewall if unused |
 | `8555/tcp,udp` | Frigate/go2rtc | WebRTC | LAN only |
 | `32168` | CodeProject.AI | Dashboard and REST API | LAN only |

@@ -1,0 +1,43 @@
+# Stable settings. Camera entries are generated in config.yml.
+mqtt:
+  enabled: false
+
+ffmpeg:
+  global_args: -hide_banner -loglevel warning -threads 2
+  hwaccel_args: ""
+
+detectors:
+  cpu1:
+    type: cpu
+    num_threads: 2
+
+objects:
+  track:
+    - person
+    - cat
+    - dog
+    - cell phone
+    - laptop
+
+review:
+  alerts:
+    labels:
+      - person
+
+record:
+  enabled: true
+  alerts:
+    retain:
+      days: 30
+      mode: all
+  detections:
+    retain:
+      days: 30
+      mode: all
+
+snapshots:
+  enabled: true
+  retain:
+    default: 30
+    objects:
+      person: 30

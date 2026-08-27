@@ -1,6 +1,6 @@
 import unittest
 
-from manager import best_mode, render
+from manager import best_mode, parse_v4l2_groups, public_state, render
 
 
 class BestModeTests(unittest.TestCase):
@@ -28,7 +28,7 @@ class BestModeTests(unittest.TestCase):
         }})
         self.assertIn('input_format=mjpeg&video_size=1920x1080&framerate=30#video=h264', config)
         self.assertIn('fps: 5', config)
-        self.assertIn('video0: video0', config)
+        self.assertIn('Native: video0', config)
 
     def test_native_h264_is_copied(self):
         config = render({'video0': {
@@ -37,6 +37,47 @@ class BestModeTests(unittest.TestCase):
         }})
         self.assertIn('input_format=h264', config)
         self.assertIn('#video=copy', config)
+
+    def test_physical_camera_groups_select_nodes(self):
+        listing = """UVC Camera (usb-a):
+        /dev/video0
+        /dev/video1
+        /dev/media0
+
+GENERAL WEBCAM (usb-b):
+        /dev/video2
+        /dev/video3
+        /dev/media1
+"""
+        self.assertEqual([
+            {'label':'UVC Camera (usb-a)','nodes':['/dev/video0','/dev/video1']},
+            {'label':'GENERAL WEBCAM (usb-b)','nodes':['/dev/video2','/dev/video3']},
+        ], parse_v4l2_groups(listing))
+
+    def test_compressed_format_wins_at_same_native_size(self):
+        modes = """
+        [0]: 'YUYV'
+          Size: Discrete 1920x1080
+            Interval: Discrete 0.033s (30.000 fps)
+        [1]: 'MJPG'
+          Size: Discrete 1920x1080
+            Interval: Discrete 0.033s (30.000 fps)
+        """
+        self.assertEqual((1920,1080,30.0,'mjpeg'), best_mode(modes))
+
+    def test_network_h264_uses_native_restream(self):
+        config=render({'front':{'id':'front','kind':'network','path':'rtsp://camera/main','name':'front','enabled':True,'width':2560,'height':1440,'fps':25,'input_format':'h264'}})
+        self.assertIn('ffmpeg:rtsp://camera/main#video=copy',config)
+        self.assertIn('width: 2560',config)
+        self.assertIn('height: 1440',config)
+
+    def test_offline_camera_is_not_rendered(self):
+        config=render({'old':{'id':'old','kind':'usb','path':'/dev/video9','name':'old','enabled':True,'status':'offline','width':640,'height':480,'fps':30,'input_format':'mjpeg'}})
+        self.assertIn('cameras: {}',config)
+
+    def test_credentials_are_redacted_from_api_state(self):
+        state=public_state({'front':{'path':'rtsp://admin:secret@192.168.1.20/live'}})
+        self.assertEqual('rtsp://***:***@192.168.1.20/live',state['front']['path'])
 
 
 if __name__ == '__main__':

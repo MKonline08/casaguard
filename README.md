@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/CasaOS-compatible-00A6A6?style=for-the-badge" alt="CasaOS compatible">
 </p>
 
-<p align="center"><strong>Private, local-first room security for a single USB webcam.</strong><br>CPU-only • no cloud account • no subscription • Docker Compose</p>
+<p align="center"><strong>Private, local-first security for USB, ONVIF, and RTSP cameras.</strong><br>Automatic discovery • native-quality live feeds • no cloud account • Docker Compose</p>
 
 ```
    _____                 ____                     _
@@ -42,7 +42,7 @@ cd casaguard
 chmod +x scripts/*.sh && ./scripts/install.sh
 ```
 
-Open `http://YOUR-CASAOS-IP:5000` to finish Frigate’s first-run administrator setup. The first CodeProject.AI start can take several minutes while it initializes.
+Open `http://YOUR-CASAOS-IP:8971` to review discovered cameras, then open `http://YOUR-CASAOS-IP:5000` to finish Frigate’s first-run administrator setup. The first CodeProject.AI start can take several minutes while it initializes.
 
 ### Quick start — three commands
 
@@ -58,7 +58,8 @@ Set `TZ` in `.env` (for example `America/Chicago`) before the final command. The
 
 ```mermaid
 flowchart LR
-  cam["📷 Logitech USB webcam\n/dev/video0"] -->|"640×480 · 5 fps"| frigate["🔒 Frigate NVR\nCPU detection + recordings"]
+  cam["📷 USB / ONVIF / RTSP cameras"] -->|"Native resolution and FPS"]| manager["Camera manager\ndiscovery + validation"]
+  manager --> frigate["🔒 Frigate NVR\nH.264 live view + recordings"]
   frigate -->|"events, snapshots & API"| ui["🖥️ Frigate UI / browser notifications"]
   frigate -. "snapshot or recording export" .-> cpai["🧠 CodeProject.AI\nface + custom object + audio modules"]
   cpai -->|"match / classification result"| alerts["📱 Your alert integration\nHome Assistant, ntfy, or webhook bridge"]
@@ -80,7 +81,7 @@ Frigate and CodeProject.AI are intentionally separate services: Frigate owns rea
 | Host OS | 64-bit Linux + Docker Compose v2 | CasaOS on Linux |
 | CPU | 2 modern cores | **AMD Ryzen laptop — ✅ Tested & Verified profile** |
 | Memory | 4 GB | **8 GB — ✅ Tested & Verified profile** |
-| Camera | V4L2-compatible USB webcam | Logitech USB webcam at `/dev/video0` |
+| Camera | V4L2 USB or ONVIF/RTSP network camera | Multiple cameras supported |
 | Storage | 20 GB free | 100 GB+ recommended for seven days of continuous video |
 | GPU | Not required | **No GPU acceleration used** |
 
@@ -101,6 +102,7 @@ The `1.5 GB` Frigate and `1 GB` CodeProject.AI ceilings preserve memory for Casa
 | Service | Port | Use |
 |---|---:|---|
 | Frigate | `5000` | NVR UI and API |
+| Camera manager | `8971` | Discovery, native mode details, and RTSP setup |
 | go2rtc | `8554`, `8555` | Local RTSP / WebRTC live view |
 | CodeProject.AI | `32168` | Dashboard and REST API |
 
