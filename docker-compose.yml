@@ -7,7 +7,7 @@ services:
     restart: unless-stopped
     shm_size: "128mb"
     devices:
-      - /dev/video0:/dev/video0
+      - /dev:/dev
     ports:
       - "${FRIGATE_PORT:-5000}:5000"
       - "8554:8554"       # RTSP restream (LAN only; firewall if exposed)
@@ -32,6 +32,26 @@ services:
       timeout: 10s
       retries: 5
       start_period: 90s
+    security_opt:
+      - no-new-privileges:true
+  camera-manager:
+    build: ./camera-manager
+    container_name: casaguard-camera-manager
+    restart: unless-stopped
+    ports:
+      - "${CAMERA_MANAGER_PORT:-8971}:8971"
+    environment:
+      TZ: ${TZ:-Etc/UTC}
+      FRIGATE_URL: http://frigate:5000
+      SCAN_SECONDS: ${CAMERA_SCAN_SECONDS:-30}
+    volumes:
+      - ./frigate:/frigate
+      - camera-manager-state:/state
+      - /dev:/dev
+    depends_on:
+      frigate:
+        condition: service_started
+    privileged: true
     security_opt:
       - no-new-privileges:true
 
@@ -98,3 +118,5 @@ volumes:
     name: casaguard_codeproject_modules
   webhook-relay-state:
     name: casaguard_webhook_relay_state
+  camera-manager-state:
+    name: casaguard_camera_manager_state

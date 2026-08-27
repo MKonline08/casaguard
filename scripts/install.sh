@@ -12,7 +12,9 @@ info() { echo "==> $*"; }
 command -v docker >/dev/null 2>&1 || fail "Docker is not installed. Install CasaOS first."
 docker info >/dev/null 2>&1 || fail "Docker is unavailable to this user. Try: sudo usermod -aG docker $USER, then sign out/in."
 docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required."
-[[ -e /dev/video0 ]] || fail "/dev/video0 was not found. Connect the Logitech webcam, then run scripts/camera-test.sh."
+if ! compgen -G "/dev/video*" >/dev/null; then
+  echo "WARNING: No USB camera found. CasaGuard will continue and discover cameras later."
+fi
 
 if ! grep -qi 'CasaOS' /etc/os-release 2>/dev/null && [[ ! -d /var/lib/casaos ]]; then
   echo "WARNING: CasaOS was not detected. Continuing on a supported Linux Docker host."
@@ -24,10 +26,12 @@ mkdir -p frigate models
 chmod 755 scripts/install.sh scripts/camera-test.sh
 
 info "Checking the webcam..."
-./scripts/camera-test.sh /dev/video0
+for device in /dev/video*; do
+  [[ -e "$device" ]] && ./scripts/camera-test.sh "$device" || true
+done
 
 info "Pulling CPU-only images (the CodeProject.AI image is large on first pull)..."
-"${COMPOSE[@]}" pull
+"${COMPOSE[@]}" pull frigate codeproject-ai
 
 info "Building the local person-event webhook relay..."
 "${COMPOSE[@]}" build webhook-relay
