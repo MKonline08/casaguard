@@ -32,8 +32,7 @@ def render(cams):
     for cam in cams.values():
         if cam.get('enabled',True) and cam.get('kind')=='usb':
             name=cam['name'].replace('-','_').replace(' ','_')
-            dev=cam["path"].replace('/dev/video','')
-            lines += [f'    {name}:',f'      - "ffmpeg:device?video={dev}&video_size={cam.get("width",640)}x{cam.get("height",480)}&framerate={cam.get("fps",5)}#video=mjpeg"']
+            lines += [f'    {name}:',f'      - "ffmpeg:device?video={cam["path"]}&video_size={cam.get("width",640)}x{cam.get("height",480)}&framerate={cam.get("fps",5)}#video=mjpeg"']
     lines += ['cameras:']
     for cam in cams.values():
         if not cam.get('enabled',True): continue
