@@ -1,4 +1,5 @@
 .env
+frigate/config.yml
 frigate/*.db
 frigate/*.db-*
 frigate/notifications.pem

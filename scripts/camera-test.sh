@@ -24,5 +24,5 @@ if ffmpeg -hide_banner -loglevel error -f v4l2 -video_size 640x480 -framerate 5 
   SIZE="$(wc -c < "$WORK_DIR/frame.jpg")"
   echo "PASS: captured a ${SIZE}-byte test frame. CasaGuard can use $CAMERA."
 else
-  fail "capture failed. Copy the format from the list above into frigate/config.yml."
+  fail "capture failed. Review the formats above; the camera manager will select a supported native mode."
 fi

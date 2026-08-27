@@ -45,7 +45,7 @@ docker compose logs -f frigate
 The supplied 640×480/5-fps profile is deliberately conservative, but CPU decoding and CPU detection are still real work.
 
 1. Confirm no GPU preset was added: `hwaccel_args` should remain empty.
-2. Lower `detect.fps` in `frigate/config.yml` from `5` to `3`.
+2. Lower the detection FPS through the camera-manager settings if the CPU detector cannot keep up. Live feeds retain their native FPS separately.
 3. Reduce camera resolution to `320x240` after verifying the webcam supports it.
 4. Track fewer labels; `person` alone is the best low-power baseline.
 5. Do not run face recognition, sound classification, custom objects, and Frigate review at the same time on an 8 GB system.

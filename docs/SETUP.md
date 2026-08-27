@@ -23,7 +23,7 @@ CasaGuard is a local multi-camera deployment for CasaOS. It discovers V4L2 USB c
 7. Start the app. Go to `http://CASAOS-IP:5000` and set the Frigate account password when prompted.
 8. Go to `http://CASAOS-IP:32168` and verify CodeProject.AI reports healthy.
 
-The Compose file mounts `./frigate/config.yml`; when using CasaOS’s editor, keep the checked-out repository at a stable path so that bind mount remains valid. The one-command route below avoids that extra UI mapping work.
+The generated Frigate configuration is stored in the `casaguard_frigate_config` Docker volume. It is intentionally not tracked by Git, so automatic camera updates cannot block future `git pull` operations.
 
 ## Option B — recommended one-command install
 
