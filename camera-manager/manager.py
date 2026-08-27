@@ -51,7 +51,9 @@ def scan():
     save(cams)
     # Preserve the non-camera sections of the existing config and replace its cameras block.
     old=CONFIG.read_text() if CONFIG.exists() else ''
-    head=old.split('\ncameras:',1)[0] if '\ncameras:' in old else old
+    head=old
+    if '\ngo2rtc:' in head: head=head.split('\ngo2rtc:',1)[0]
+    if '\ncameras:' in head: head=head.split('\ncameras:',1)[0]
     CONFIG.write_text(head.rstrip()+'\n\n'+render(cams))
     try:
         req=urllib.request.Request(os.getenv('FRIGATE_URL','http://frigate:5000')+'/api/config/save',method='POST',data=b'{}')
