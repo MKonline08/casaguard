@@ -33,6 +33,20 @@ Common fixes:
 - Confirm `casaguard-camera-manager` is healthy and privileged device access is allowed by CasaOS.
 - Open port `8971` and confirm the camera pipeline says **running**. CasaGuard selects MJPEG/H.264 handling automatically; do not hand-edit the generated YAML.
 
+## A USB camera is green, corrupted, or repeatedly reconnecting
+
+Open `http://YOUR-CASAOS-IP:8971` and inspect **Mode validation** and **Fallback** for that camera. CasaGuard strictly decodes candidate V4L2 modes and retains the highest verified-good choice. Click **Retest modes** after changing a cable, port, or camera; existing night settings and recordings are preserved.
+
+The Logitech C270 (`046d:0825`) is limited to its manufacturer-specified 1280x720 at 30 FPS even though some Linux drivers advertise 1280x960. If MJPEG remains malformed, CasaGuard tries a verified YUYV or lower MJPEG mode instead of sending green frames to Frigate. If every mode fails, only that camera is marked unhealthy.
+
+Check whether the kernel is also resetting the physical device:
+
+```bash
+dmesg --ctime | grep -Ei 'reset|disconnect|bandwidth|uvc.*error' | tail -40
+```
+
+Software fallback can avoid a broken camera mode, but continuing resets in this output still indicate a USB driver, cable, port, power, or camera hardware problem.
+
 After changing configuration, validate by restarting Frigate:
 
 ```bash

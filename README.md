@@ -103,7 +103,7 @@ The `3 GB` Frigate and `1 GB` CodeProject.AI ceilings preserve memory for CasaOS
 | Service | Port | Use |
 |---|---:|---|
 | Frigate | `5000` | NVR UI and API |
-| Camera manager | `8971` | Discovery, native mode details, and RTSP setup |
+| Camera manager | `8971` | Discovery, verified mode health, day/night controls, and RTSP setup |
 | go2rtc local API | `1984` | Loopback-only camera ingest and light sampling |
 | go2rtc | `8554`, `8555` | Local RTSP / WebRTC live view |
 | CodeProject.AI | `32168` | Dashboard and REST API |

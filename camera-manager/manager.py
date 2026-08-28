@@ -9,7 +9,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
-from collections import Counter
+from collections import Counter, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from xml.etree import ElementTree
@@ -26,6 +26,7 @@ LOCK = threading.RLock()
 WORKER_LOCK = threading.RLock()
 RUNTIME = {}
 PUBLIC_WORKERS = {}
+MODE_VALIDATION = set()
 
 FORMATS = {"H264": "h264", "MJPG": "mjpeg", "JPEG": "mjpeg", "HEVC": "hevc", "YUYV": "yuyv422", "NV12": "nv12"}
 PRIORITY = {"h264": 4, "mjpeg": 3, "hevc": 2, "nv12": 1, "yuyv422": 0}
@@ -40,8 +41,14 @@ DEFAULT_NIGHT = {
 }
 PRESERVED_FIELDS = (
     "name", "enabled", "night_mode", "night_strength", "dark_threshold", "bright_threshold",
-    "night_active", "last_transition", "night_error",
+    "night_active", "last_transition", "night_error", "selected_mode", "validation_status",
+    "fallback_reason", "last_mode_validation", "validated_capabilities_hash",
 )
+
+KNOWN_USB_LIMITS = {
+    # Logitech C270. The device advertises 1280x960, but Logitech specifies 720p30.
+    ("046d", "0825"): (1280, 720),
+}
 
 
 def run(command, timeout=8):
@@ -56,7 +63,7 @@ def base_label(value):
     return re.sub(r"\s*\(usb-[^)]+\)\s*$", "", str(value).rstrip(":"), flags=re.IGNORECASE).strip()
 
 
-def best_mode(text):
+def parse_modes(text):
     candidates = []
     current_format = "mjpeg"
     current_size = None
@@ -72,10 +79,94 @@ def best_mode(text):
             continue
         match = re.search(r"Interval:\s+Discrete.*\((\d+(?:\.\d+)?)\s+fps\)", line)
         if current_size and match:
-            candidates.append((*current_size, float(match.group(1)), current_format))
+            candidates.append({"width": current_size[0], "height": current_size[1],
+                               "fps": float(match.group(1)), "input_format": current_format})
+    unique = {}
+    for mode in candidates:
+        key = (mode["width"], mode["height"], mode["fps"], mode["input_format"])
+        unique[key] = mode
+    return list(unique.values())
+
+
+def mode_tuple(mode):
+    return int(mode["width"]), int(mode["height"]), float(mode["fps"]), mode["input_format"]
+
+
+def best_mode(text):
+    candidates = parse_modes(text)
     if not candidates:
         return 640, 480, 5.0, "mjpeg"
-    return max(candidates, key=lambda mode: (mode[0] * mode[1], PRIORITY.get(mode[3], 0), mode[2]))
+    return mode_tuple(max(candidates, key=lambda mode: (
+        mode["width"] * mode["height"], PRIORITY.get(mode["input_format"], 0), mode["fps"])))
+
+
+def capabilities_hash(modes):
+    normalized = sorted(mode_tuple(mode) for mode in modes)
+    return hashlib.sha256(json.dumps(normalized).encode()).hexdigest()[:16]
+
+
+def ranked_modes(modes, attributes=None, limit=16):
+    attributes = attributes or {}
+    maximum = KNOWN_USB_LIMITS.get((attributes.get("vendor"), attributes.get("product")))
+    filtered = [dict(mode) for mode in modes if not maximum or
+                (int(mode["width"]) <= maximum[0] and int(mode["height"]) <= maximum[1])]
+    if not filtered:
+        filtered = [dict(mode) for mode in modes]
+    by_format = {}
+    for mode in filtered:
+        by_format.setdefault(mode["input_format"], []).append(mode)
+    for values in by_format.values():
+        values.sort(key=lambda mode: (mode["width"] * mode["height"], mode["fps"]), reverse=True)
+    ordered = []
+    formats = sorted(by_format, key=lambda value: PRIORITY.get(value, -1), reverse=True)
+    depth = 0
+    while len(ordered) < limit and any(depth < len(by_format[value]) for value in formats):
+        for value in formats:
+            if depth < len(by_format[value]):
+                ordered.append(by_format[value][depth])
+                if len(ordered) >= limit:
+                    break
+        depth += 1
+    return ordered
+
+
+def ffmpeg_input_format(value):
+    return {"yuyv422": "yuyv422", "mjpeg": "mjpeg", "h264": "h264", "hevc": "hevc",
+            "nv12": "nv12"}.get(value, value)
+
+
+def validate_usb_mode(path, mode, timeout=8):
+    frames = max(8, min(45, round(float(mode["fps"]) * 1.5)))
+    command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-xerror", "-nostdin",
+               "-f", "v4l2", "-input_format", ffmpeg_input_format(mode["input_format"]),
+               "-video_size", f'{int(mode["width"])}x{int(mode["height"])}',
+               "-framerate", f'{float(mode["fps"]):g}', "-i", path,
+               "-frames:v", str(frames), "-f", "null", "-"]
+    try:
+        result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return False, "validation timed out"
+    error = re.sub(r"\s+", " ", result.stderr or "").strip()[-600:]
+    if result.returncode:
+        return False, error or f"FFmpeg exited with status {result.returncode}"
+    return True, ""
+
+
+def select_verified_mode(path, modes, attributes=None, validator=validate_usb_mode):
+    candidates = ranked_modes(modes, attributes)
+    errors = []
+    for index, mode in enumerate(candidates):
+        valid, error = validator(path, mode)
+        if valid:
+            reason = ""
+            if index:
+                first = candidates[0]
+                reason = (f'Fallback from {first["width"]}x{first["height"]}@{first["fps"]:g} '
+                          f'{first["input_format"]}: {errors[0] if errors else "validation failed"}')
+            return dict(mode), reason
+        errors.append(error or "validation failed")
+    return None, "; ".join(errors[:3]) or "No usable camera mode was found"
 
 
 def parse_v4l2_groups(text):
@@ -148,10 +239,16 @@ def discover_usb():
         if not path:
             continue
         try:
-            width, height, fps, input_format = best_mode(run(["v4l2-ctl", "--device", path, "--list-formats-ext"], 5))
+            modes = parse_modes(run(["v4l2-ctl", "--device", path, "--list-formats-ext"], 5))
+            width, height, fps, input_format = mode_tuple(ranked_modes(modes)[0])
         except Exception:
+            modes = [{"width": 640, "height": 480, "fps": 5.0, "input_format": "mjpeg"}]
             width, height, fps, input_format = 640, 480, 5.0, "mjpeg"
-        digest, stable = usb_identity(read_usb_attributes(path), base_label(group["label"]))
+        attributes = read_usb_attributes(path)
+        ranked = ranked_modes(modes, attributes)
+        if ranked:
+            width, height, fps, input_format = mode_tuple(ranked[0])
+        digest, stable = usb_identity(attributes, base_label(group["label"]))
         camera_id = f"usb_{digest}"
         if camera_id in used_ids:
             # Identical cameras without serials cannot be distinguished across port moves. Keep
@@ -167,7 +264,8 @@ def discover_usb():
             "id": camera_id, "kind": "usb", "name": name, "label": group["label"],
             "base_label": base_label(group["label"]), "hardware_id": digest, "stable_hardware_id": stable,
             "path": path, "enabled": True, "status": "available", "width": width, "height": height,
-            "fps": fps, "input_format": input_format,
+            "fps": fps, "input_format": input_format, "usb_attributes": attributes,
+            "available_modes": modes, "capabilities_hash": capabilities_hash(modes),
         }))
     return cameras
 
@@ -233,7 +331,9 @@ def public_state(cameras):
     safe = json.loads(json.dumps(cameras))
     for camera_id, camera in safe.items():
         camera["path"] = re.sub(r"(?<=://)[^/@]+@", "***:***@", camera.get("path", ""))
-        camera.pop("stable_hardware_id", None)
+        for private in ("stable_hardware_id", "usb_attributes", "available_modes", "capabilities_hash",
+                        "validated_capabilities_hash"):
+            camera.pop(private, None)
         runtime = RUNTIME.get(camera_id, {})
         camera["luminance"] = runtime.get("luminance")
         camera["night_status"] = runtime.get("status", "starting")
@@ -243,6 +343,11 @@ def public_state(cameras):
         worker = PUBLIC_WORKERS.get(camera_id)
         camera["pipeline_running"] = bool(worker and worker["process"].poll() is None)
     return safe
+
+
+def camera_is_active(camera):
+    return bool(camera.get("enabled") and camera.get("path") and
+                camera.get("status") in ("available", "configured"))
 
 
 def source_stream_name(camera):
@@ -267,7 +372,7 @@ def placeholder_stream_source(camera):
 
 
 def render(cameras):
-    enabled = [c for c in cameras.values() if c.get("enabled") and c.get("path") and c.get("status") != "offline"]
+    enabled = [camera for camera in cameras.values() if camera_is_active(camera)]
     lines = ["# Generated by CasaGuard. Manage cameras at port 8971.", "go2rtc:",
              "  streams:" if enabled else "  streams: {}"]
     for camera in enabled:
@@ -387,7 +492,7 @@ def encoder_args(camera, night_active=None):
 def public_worker_command(camera):
     source = urllib.parse.quote(source_stream_name(camera), safe="")
     destination = urllib.parse.quote(slug(camera["name"]), safe="")
-    return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-rtsp_transport", "tcp",
+    return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-xerror", "-nostdin", "-rtsp_transport", "tcp",
             "-i", f"rtsp://127.0.0.1:8554/{source}", "-map", "0:v:0", "-an",
             *encoder_args(camera), "-f", "mpegts", "-method", "POST",
             f"{GO2RTC_URL}/api/stream.ts?dst={destination}"]
@@ -395,6 +500,7 @@ def public_worker_command(camera):
 
 def worker_signature(camera):
     return (source_stream_name(camera), slug(camera["name"]), camera.get("input_format"),
+            int(camera.get("width", 640)), int(camera.get("height", 480)),
             float(camera.get("fps", 5)), bool(camera.get("night_active")), camera.get("night_strength"))
 
 
@@ -413,10 +519,27 @@ def stop_public_worker(camera_id):
         process.wait(timeout=2)
 
 
+def capture_worker_errors(camera_id, process):
+    stream = getattr(process, "stderr", None)
+    if stream is None:
+        return
+    try:
+        for line in stream:
+            with WORKER_LOCK:
+                entry = PUBLIC_WORKERS.get(camera_id)
+                if not entry or entry.get("process") is not process:
+                    return
+                entry["errors"].append(re.sub(r"\s+", " ", line).strip())
+    except (OSError, ValueError):
+        return
+
+
 def start_public_worker(camera_id, camera):
     process = subprocess.Popen(public_worker_command(camera), stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, close_fds=True)
-    PUBLIC_WORKERS[camera_id] = {"process": process, "signature": worker_signature(camera), "started": time.monotonic()}
+                               stderr=subprocess.PIPE, text=True, close_fds=True)
+    PUBLIC_WORKERS[camera_id] = {"process": process, "signature": worker_signature(camera),
+                                 "started": time.monotonic(), "errors": deque(maxlen=20)}
+    threading.Thread(target=capture_worker_errors, args=(camera_id, process), daemon=True).start()
     RUNTIME.setdefault(camera_id, {})["pipeline_pid"] = process.pid
     return process
 
@@ -443,7 +566,8 @@ def replace_public_worker(camera_id, camera, verify=True):
 def supervise_workers_once():
     cameras = load_state()
     active = {camera_id: camera for camera_id, camera in cameras.items()
-              if camera.get("enabled") and camera.get("path") and camera.get("status") != "offline"}
+              if camera_is_active(camera) and camera_id not in MODE_VALIDATION}
+    retest = []
     with WORKER_LOCK:
         for camera_id in list(PUBLIC_WORKERS):
             if camera_id not in active:
@@ -453,7 +577,23 @@ def supervise_workers_once():
             if entry and entry["process"].poll() is None and entry["signature"] == worker_signature(camera):
                 continue
             if entry:
+                runtime = RUNTIME.setdefault(camera_id, {})
+                now = time.monotonic()
+                failures = runtime.setdefault("worker_failures", deque(maxlen=10))
+                failures.append(now)
+                while failures and now - failures[0] > 60:
+                    failures.popleft()
+                error = "; ".join(value for value in entry.get("errors", ()) if value)[-1200:]
+                if error:
+                    runtime["worker_error"] = error
+                if (camera.get("kind") == "usb" and len(failures) >= 3 and
+                        now >= runtime.get("next_mode_retest", 0)):
+                    runtime["next_mode_retest"] = now + 300
+                    runtime["worker_retry_at"] = now + 60
+                    retest.append(camera_id)
                 stop_public_worker(camera_id)
+                if camera_id in retest:
+                    continue
             runtime = RUNTIME.setdefault(camera_id, {})
             if time.monotonic() < runtime.get("worker_retry_at", 0):
                 continue
@@ -462,6 +602,14 @@ def supervise_workers_once():
                 runtime.update({"worker_retry_at": time.monotonic() + 5, "worker_error": ""})
             except Exception as error:
                 runtime.update({"worker_error": str(error), "worker_retry_at": time.monotonic() + 10})
+    for camera_id in retest:
+        MODE_VALIDATION.add(camera_id)
+        try:
+            scan(restart=True, force_ids={camera_id})
+        except Exception as error:
+            RUNTIME.setdefault(camera_id, {})["worker_error"] = f"automatic mode retest failed: {error}"
+        finally:
+            MODE_VALIDATION.discard(camera_id)
 
 
 def apply_stream_state(cameras, camera_id, target, reason, force=False):
@@ -489,6 +637,60 @@ def apply_stream_state(cameras, camera_id, target, reason, force=False):
         save_state(cameras)
         runtime["status"] = "error"
         return False
+
+
+def selected_mode_is_available(camera):
+    selected = camera.get("selected_mode")
+    if not selected:
+        return False
+    allowed = ranked_modes(camera.get("available_modes", []), camera.get("usb_attributes"), limit=10_000)
+    return any(mode_tuple(mode) == mode_tuple(selected) for mode in allowed)
+
+
+def apply_selected_mode(camera, selected):
+    camera["selected_mode"] = dict(selected)
+    camera["width"], camera["height"], camera["fps"], camera["input_format"] = mode_tuple(selected)
+
+
+def verify_usb_camera(camera, force=False, validator=validate_usb_mode):
+    if camera.get("kind") != "usb" or camera.get("status") == "offline":
+        return False
+    current_hash = camera.get("capabilities_hash", "")
+    if (not force and camera.get("validation_status") == "verified" and
+            camera.get("validated_capabilities_hash") == current_hash and
+            selected_mode_is_available(camera)):
+        apply_selected_mode(camera, camera["selected_mode"])
+        camera["status"] = "available"
+        return False
+    camera_id = camera["id"]
+    MODE_VALIDATION.add(camera_id)
+    camera["validation_status"] = "validating"
+    try:
+        selected, reason = select_verified_mode(camera["path"], camera.get("available_modes", []),
+                                                camera.get("usb_attributes"), validator=validator)
+        camera["last_mode_validation"] = int(time.time())
+        camera["validated_capabilities_hash"] = current_hash
+        if selected:
+            apply_selected_mode(camera, selected)
+            camera["validation_status"] = "verified"
+            camera["fallback_reason"] = reason
+            camera["status"] = "available"
+        else:
+            camera["validation_status"] = "failed"
+            camera["fallback_reason"] = reason
+            camera["status"] = "unhealthy"
+        return True
+    finally:
+        MODE_VALIDATION.discard(camera_id)
+
+
+def verify_usb_cameras(cameras, force_ids=None, validator=validate_usb_mode):
+    force_ids = set(force_ids or ())
+    changed = False
+    for camera_id, camera in cameras.items():
+        if camera.get("kind") == "usb" and camera.get("status") != "offline":
+            changed = verify_usb_camera(camera, camera_id in force_ids, validator) or changed
+    return changed
 
 
 def merge_usb_state(cameras, discovered):
@@ -520,7 +722,7 @@ def merge_usb_state(cameras, discovered):
     return result
 
 
-def scan(restart=True):
+def scan(restart=True, force_ids=None):
     with LOCK:
         discovered_usb = discover_usb()
         cameras = merge_usb_state(load_state(), discovered_usb)
@@ -530,6 +732,7 @@ def scan(restart=True):
                 camera["status"] = "offline"
         for discovered in discover_onvif():
             cameras.setdefault(discovered["id"], discovered)
+        verify_usb_cameras(cameras, force_ids=force_ids)
         save_state(cameras)
         changed = write_config(cameras)
     if changed and restart:
@@ -540,7 +743,8 @@ def scan(restart=True):
 def monitor_once():
     with LOCK:
         cameras = load_state()
-        camera_ids = [cid for cid, camera in cameras.items() if camera.get("enabled") and camera.get("path") and camera.get("status") != "offline"]
+        camera_ids = [cid for cid, camera in cameras.items() if camera_is_active(camera)
+                      and cid not in MODE_VALIDATION]
     for camera_id in camera_ids:
         with LOCK:
             cameras = load_state()
@@ -566,7 +770,8 @@ def monitor_once():
 INDEX = r'''<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CasaGuard Cameras</title><style>body{font:16px system-ui;max-width:1000px;margin:32px auto;padding:0 16px;background:#111;color:#eee}button,input,select{padding:9px;margin:4px;background:#171717;color:#eee;border:1px solid #555;border-radius:5px}article{background:#222;padding:14px;margin:10px 0;border-radius:10px}.ok{color:#5f5}.bad{color:#f88}.meta{color:#bbb;line-height:1.7}.controls{display:flex;flex-wrap:wrap;align-items:center;margin-top:8px}label{font-size:13px;color:#ccc}</style><h1>CasaGuard cameras</h1><button onclick="rescan()">Rescan USB and ONVIF</button><div id="list"></div><h2>Add RTSP camera</h2><input id="name" placeholder="Camera name"><input id="url" size="55" placeholder="rtsp://user:password@camera/stream"><button onclick="add()">Add</button><script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function patchCamera(id,body){let r=await fetch('/api/cameras/'+encodeURIComponent(id),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)alert((await r.json()).error);await load()}
-async function load(){let c=await fetch('/api/cameras').then(r=>r.json());list.innerHTML=Object.values(c).map(x=>`<article><b>${esc(x.name)}</b> <span class="${x.status==='available'||x.status==='configured'?'ok':'bad'}">${esc(x.status)}</span><div class="meta">${esc(x.kind)} · ${esc(x.width||'?')}×${esc(x.height||'?')} @ ${esc(x.fps||'?')} fps · ${esc(x.input_format||'')}<br>Light: ${x.luminance??'waiting'} / 255 · Active profile: <b>${x.night_active?'Night':'Day'}</b> · Monitor: ${esc(x.night_status)} · Pipeline: <span class="${x.pipeline_running?'ok':'bad'}">${x.pipeline_running?'running':'reconnecting'}</span>${x.last_transition?'<br>Last switch: '+new Date(x.last_transition*1000).toLocaleString():''}${x.night_error?'<br><span class="bad">'+esc(x.night_error)+'</span>':''}${x.monitor_error?'<br><span class="bad">Monitor: '+esc(x.monitor_error)+'</span>':''}${x.pipeline_error?'<br><span class="bad">Pipeline: '+esc(x.pipeline_error)+'</span>':''}</div><div class="controls"><label>Mode <select onchange="patchCamera('${esc(x.id)}',{night_mode:this.value})"><option value="auto" ${x.night_mode==='auto'?'selected':''}>Auto</option><option value="day" ${x.night_mode==='day'?'selected':''}>Day</option><option value="night" ${x.night_mode==='night'?'selected':''}>Night</option></select></label><label>Strength <select onchange="patchCamera('${esc(x.id)}',{night_strength:this.value})"><option value="gentle" ${x.night_strength==='gentle'?'selected':''}>Gentle</option><option value="balanced" ${x.night_strength==='balanced'?'selected':''}>Balanced</option><option value="aggressive" ${x.night_strength==='aggressive'?'selected':''}>Aggressive</option></select></label><label>Dark ≤ <input type="number" min="0" max="255" value="${esc(x.dark_threshold)}" onchange="patchCamera('${esc(x.id)}',{dark_threshold:Number(this.value)})" size="4"></label><label>Bright ≥ <input type="number" min="0" max="255" value="${esc(x.bright_threshold)}" onchange="patchCamera('${esc(x.id)}',{bright_threshold:Number(this.value)})" size="4"></label></div></article>`).join('')}
+async function retest(id){if(!confirm('Retest this camera? Its feed will reconnect briefly.'))return;let r=await fetch('/api/cameras/'+encodeURIComponent(id)+'/retest',{method:'POST'});if(!r.ok)alert((await r.json()).error);await load()}
+async function load(){let c=await fetch('/api/cameras').then(r=>r.json());list.innerHTML=Object.values(c).map(x=>`<article><b>${esc(x.name)}</b> <span class="${x.status==='available'||x.status==='configured'?'ok':'bad'}">${esc(x.status)}</span><div class="meta">${esc(x.kind)} · ${esc(x.width||'?')}×${esc(x.height||'?')} @ ${esc(x.fps||'?')} fps · ${esc(x.input_format||'')}<br>Mode validation: <span class="${x.validation_status==='verified'||x.kind!=='usb'?'ok':'bad'}">${esc(x.validation_status||'not required')}</span>${x.last_mode_validation?' · '+new Date(x.last_mode_validation*1000).toLocaleString():''}${x.fallback_reason?'<br><span class="bad">'+esc(x.fallback_reason)+'</span>':''}<br>Light: ${x.luminance??'waiting'} / 255 · Active profile: <b>${x.night_active?'Night':'Day'}</b> · Monitor: ${esc(x.night_status)} · Pipeline: <span class="${x.pipeline_running?'ok':'bad'}">${x.pipeline_running?'running':'reconnecting'}</span>${x.last_transition?'<br>Last switch: '+new Date(x.last_transition*1000).toLocaleString():''}${x.night_error?'<br><span class="bad">'+esc(x.night_error)+'</span>':''}${x.monitor_error?'<br><span class="bad">Monitor: '+esc(x.monitor_error)+'</span>':''}${x.pipeline_error?'<br><span class="bad">Pipeline: '+esc(x.pipeline_error)+'</span>':''}</div><div class="controls"><label>Mode <select onchange="patchCamera('${esc(x.id)}',{night_mode:this.value})"><option value="auto" ${x.night_mode==='auto'?'selected':''}>Auto</option><option value="day" ${x.night_mode==='day'?'selected':''}>Day</option><option value="night" ${x.night_mode==='night'?'selected':''}>Night</option></select></label><label>Strength <select onchange="patchCamera('${esc(x.id)}',{night_strength:this.value})"><option value="gentle" ${x.night_strength==='gentle'?'selected':''}>Gentle</option><option value="balanced" ${x.night_strength==='balanced'?'selected':''}>Balanced</option><option value="aggressive" ${x.night_strength==='aggressive'?'selected':''}>Aggressive</option></select></label><label>Dark ≤ <input type="number" min="0" max="255" value="${esc(x.dark_threshold)}" onchange="patchCamera('${esc(x.id)}',{dark_threshold:Number(this.value)})" size="4"></label><label>Bright ≥ <input type="number" min="0" max="255" value="${esc(x.bright_threshold)}" onchange="patchCamera('${esc(x.id)}',{bright_threshold:Number(this.value)})" size="4"></label>${x.kind==='usb'?'<button data-camera="'+esc(x.id)+'" onclick="retest(this.dataset.camera)">Retest modes</button>':''}</div></article>`).join('')}
 async function rescan(){await fetch('/api/rescan',{method:'POST'});load()}async function add(){let r=await fetch('/api/cameras',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name.value,path:url.value})});if(!r.ok)alert((await r.json()).error);load()}load();setInterval(load,10000);</script>'''.encode()
 
 
@@ -639,6 +844,29 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(400, {"error": str(error)})
 
     def do_POST(self):
+        retest = re.fullmatch(r"/api/cameras/([^/]+)/retest", self.path)
+        if retest:
+            camera_id = urllib.parse.unquote(retest.group(1))
+            try:
+                with LOCK:
+                    cameras = load_state()
+                    camera = cameras.get(camera_id)
+                    if not camera:
+                        self.reply(404, {"error": "Camera not found"})
+                        return
+                    if camera.get("kind") != "usb":
+                        self.reply(400, {"error": "Only USB camera modes can be retested"})
+                        return
+                    MODE_VALIDATION.add(camera_id)
+                    stop_public_worker(camera_id)
+                time.sleep(1)
+                cameras = scan(restart=True, force_ids={camera_id})
+                self.reply(200, public_state({camera_id: cameras[camera_id]})[camera_id])
+            except Exception as error:
+                self.reply(400, {"error": str(error)})
+            finally:
+                MODE_VALIDATION.discard(camera_id)
+            return
         if self.path == "/api/rescan":
             self.reply(200, public_state(scan()))
             return

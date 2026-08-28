@@ -4,7 +4,7 @@ import subprocess
 import shutil
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from manager import (
     NIGHT_FILTERS,
@@ -12,20 +12,26 @@ from manager import (
     RUNTIME,
     apply_stream_state,
     best_mode,
+    capabilities_hash,
     encoder_args,
     evaluate_light,
     is_capture_node,
     jpeg_luminance,
     merge_usb_state,
     monitor_once,
+    parse_modes,
     parse_v4l2_groups,
     placeholder_stream_source,
     public_state,
     public_worker_command,
+    ranked_modes,
     replace_public_worker,
     render,
     sample_luminance,
+    select_verified_mode,
+    supervise_workers_once,
     usb_identity,
+    verify_usb_camera,
     with_night_defaults,
 )
 
@@ -50,6 +56,67 @@ def camera(**overrides):
 
 
 class NativeModeTests(unittest.TestCase):
+    MODES = """
+        [0]: 'YUYV'
+          Size: Discrete 640x480
+            Interval: Discrete 0.033s (30.000 fps)
+          Size: Discrete 1280x720
+            Interval: Discrete 0.133s (7.500 fps)
+        [1]: 'MJPG'
+          Size: Discrete 640x480
+            Interval: Discrete 0.033s (30.000 fps)
+          Size: Discrete 1280x720
+            Interval: Discrete 0.033s (30.000 fps)
+          Size: Discrete 1280x960
+            Interval: Discrete 0.033s (30.000 fps)
+    """
+
+    def test_all_discrete_modes_are_parsed(self):
+        modes = parse_modes(self.MODES)
+        self.assertEqual(5, len(modes))
+        self.assertIn({"width": 1280, "height": 720, "fps": 30.0, "input_format": "mjpeg"}, modes)
+
+    def test_c270_is_capped_at_official_720p_limit(self):
+        modes = ranked_modes(parse_modes(self.MODES), {"vendor": "046d", "product": "0825"})
+        self.assertEqual((1280, 720, 30.0, "mjpeg"),
+                         (modes[0]["width"], modes[0]["height"], modes[0]["fps"], modes[0]["input_format"]))
+        self.assertNotIn((1280, 960), {(mode["width"], mode["height"]) for mode in modes})
+
+    def test_corrupt_mjpeg_falls_back_to_highest_verified_yuyv(self):
+        attempts = []
+
+        def validator(_, mode):
+            attempts.append(mode_tuple := (mode["width"], mode["height"], mode["fps"], mode["input_format"]))
+            return (mode["input_format"] == "yuyv422", "malformed MJPEG")
+
+        selected, reason = select_verified_mode(
+            "/dev/video0", parse_modes(self.MODES), {"vendor": "046d", "product": "0825"}, validator)
+        self.assertEqual((1280, 720, 7.5, "yuyv422"),
+                         (selected["width"], selected["height"], selected["fps"], selected["input_format"]))
+        self.assertEqual("mjpeg", attempts[0][3])
+        self.assertIn("Fallback from 1280x720@30 mjpeg", reason)
+
+    def test_verified_mode_is_persisted_without_retesting(self):
+        modes = parse_modes(self.MODES)
+        selected = {"width": 1280, "height": 720, "fps": 30.0, "input_format": "mjpeg"}
+        value = camera(id="usb_cam", kind="usb", available_modes=modes, selected_mode=selected,
+                       capabilities_hash=capabilities_hash(modes),
+                       validated_capabilities_hash=capabilities_hash(modes), validation_status="verified")
+        validator = Mock(side_effect=AssertionError("healthy mode should not be retested"))
+        self.assertFalse(verify_usb_camera(value, validator=validator))
+        validator.assert_not_called()
+        self.assertEqual((1280, 720, 30.0, "mjpeg"),
+                         (value["width"], value["height"], value["fps"], value["input_format"]))
+
+    def test_all_failed_modes_mark_only_camera_unhealthy(self):
+        modes = parse_modes(self.MODES)
+        value = camera(id="usb_bad", kind="usb", available_modes=modes,
+                       capabilities_hash=capabilities_hash(modes), usb_attributes={})
+        verify_usb_camera(value, force=True, validator=lambda *_: (False, "decode failed"))
+        self.assertEqual("unhealthy", value["status"])
+        self.assertEqual("failed", value["validation_status"])
+        self.assertIn("cameras: {}", render({"usb_bad": value}))
+
     def test_fps_is_selected_from_native_resolution(self):
         modes = """
         Size: Discrete 640x480
@@ -277,6 +344,7 @@ class ApiAndRecoveryTests(unittest.TestCase):
 
     def tearDown(self):
         PUBLIC_WORKERS.clear()
+        RUNTIME.clear()
 
     @patch("manager.fetch_frame", return_value=b"jpeg")
     @patch("manager.subprocess.Popen")
@@ -300,6 +368,21 @@ class ApiAndRecoveryTests(unittest.TestCase):
         self.assertTrue(apply_stream_state(cameras, "video0", True, "test"))
         restart.assert_called_once()
         self.assertIn("live switch failed", cameras["video0"]["night_error"])
+
+    @patch("manager.scan")
+    @patch("manager.start_public_worker")
+    @patch("manager.load_state")
+    def test_three_pipeline_failures_trigger_one_debounced_mode_retest(self, load, _, scan):
+        load.return_value = {"video0": camera(kind="usb")}
+        for _ in range(3):
+            failed = self.FakeProcess()
+            failed.returncode = 1
+            PUBLIC_WORKERS["video0"] = {
+                "process": failed, "signature": ("old",), "started": 0,
+                "errors": ["Invalid data found when processing input"],
+            }
+            supervise_workers_once()
+        scan.assert_called_once_with(restart=True, force_ids={"video0"})
 
 
 class DiscoveryTests(unittest.TestCase):

@@ -85,6 +85,8 @@ Every camera defaults to **Auto / Aggressive**. CasaGuard samples the hidden unf
 
 Use the camera-manager page on port `8971` to force Day or Night, select Gentle/Balanced/Aggressive enhancement, or tune the per-camera thresholds. The filter never changes native resolution or live FPS. CasaGuard keeps the hidden native capture running and replaces only the affected camera's public output pipeline. If that replacement cannot be verified, it preserves the requested mode and asks Frigate for one controlled recovery restart.
 
+USB cameras are decode-tested before Frigate uses them. CasaGuard starts with the highest advertised mode allowed for the detected hardware, rejects corrupt modes, and falls back to the highest mode that produces valid frames. The verified choice is saved by stable camera identity, so routine rescans do not interrupt a healthy feed. The camera-manager page shows the active format, resolution, validation status, and any fallback reason; **Retest modes** briefly reconnects only the selected camera and requests a controlled Frigate reload if its generated dimensions change.
+
 ## Storage and backup
 
 Docker named volumes hold durable data:
