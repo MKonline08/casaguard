@@ -85,8 +85,6 @@ Every camera defaults to **Auto / Aggressive**. CasaGuard samples the hidden unf
 
 Use the camera-manager page on port `8971` to force Day or Night, select Gentle/Balanced/Aggressive enhancement, or tune the per-camera thresholds. The filter never changes native resolution or live FPS. CasaGuard keeps the hidden native capture running and replaces only the affected camera's public output pipeline. If that replacement cannot be verified, it preserves the requested mode and asks Frigate for one controlled recovery restart.
 
-Frigate's `GO2RTC_ALLOW_ARBITRARY_EXEC` switch is enabled so its startup security pass preserves CasaGuard's source-less local ingest destinations. CasaGuard does not expose go2rtc's management port beyond `127.0.0.1`, writes generated configuration with owner-only permissions, and does not accept arbitrary command or configuration input through the camera-manager API. Keep Frigate and the camera-manager restricted to trusted LAN users.
-
 ## Storage and backup
 
 Docker named volumes hold durable data:
