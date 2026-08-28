@@ -21,7 +21,7 @@ from manager import (
     parse_modes,
     parse_v4l2_groups,
     public_state,
-    public_stream_source,
+    camera_stream_source,
     ranked_modes,
     render,
     sample_luminance,
@@ -156,12 +156,11 @@ class NativeModeTests(unittest.TestCase):
 
 
 class RenderTests(unittest.TestCase):
-    def test_usb_stream_has_hidden_native_source_and_public_h264(self):
+    def test_usb_stream_is_direct_and_public_h264(self):
         config = render({"video0": camera()})
-        self.assertIn("video0__source:", config)
-        self.assertIn("input_format=mjpeg&video_size=1920x1080&framerate=30#video=copy", config)
         self.assertIn("video0: # CasaGuard profile: day", config)
-        self.assertIn('"ffmpeg:video0__source#video=h264"', config)
+        self.assertIn("input_format=mjpeg&video_size=1920x1080&framerate=30#video=h264", config)
+        self.assertNotIn("video0__source", config)
         self.assertNotIn("__casaguard_wait", config)
         self.assertIn("fps: 5", config)
         self.assertIn("enabled: true", config)
@@ -171,7 +170,7 @@ class RenderTests(unittest.TestCase):
         config = render({"video0": camera(night_active=True)})
         self.assertIn("video0: # CasaGuard profile: night", config)
         self.assertIn("video_size=1920x1080&framerate=30", config)
-        source = public_stream_source(camera(night_active=True))
+        source = camera_stream_source(camera(night_active=True))
         self.assertIn(NIGHT_FILTERS["aggressive"], source)
         self.assertNotIn("scale=", source)
         self.assertNotIn("-r ", source)
@@ -179,23 +178,29 @@ class RenderTests(unittest.TestCase):
     def test_native_h264_day_mode_is_copied(self):
         config = render({"video0": camera(input_format="h264")})
         self.assertIn("input_format=h264", config)
-        self.assertEqual("ffmpeg:video0__source#video=copy", public_stream_source(camera(input_format="h264")))
+        self.assertEqual(
+            "ffmpeg:device?video=/dev/video0&input_format=h264&video_size=1920x1080&framerate=30#video=copy",
+            camera_stream_source(camera(input_format="h264")),
+        )
 
     def test_raw_usb_format_is_encoded_without_resizing(self):
         config = render({"video0": camera(input_format="yuyv422")})
         self.assertIn("input_format=yuyv422&video_size=1920x1080&framerate=30#video=h264", config)
-        self.assertEqual("ffmpeg:video0__source#video=copy",
-                         public_stream_source(camera(input_format="yuyv422")))
+        self.assertEqual(
+            "ffmpeg:device?video=/dev/video0&input_format=yuyv422&video_size=1920x1080&framerate=30#video=h264",
+            camera_stream_source(camera(input_format="yuyv422")),
+        )
 
-    def test_network_camera_uses_hidden_source(self):
+    def test_network_camera_uses_direct_source(self):
         value = camera(kind="network", path="rtsp://camera/main", name="front", input_format="h264")
         config = render({"front": value})
-        self.assertIn('front__source:\n      - "rtsp://camera/main"', config)
         self.assertIn("front: # CasaGuard profile: day", config)
+        self.assertIn('"ffmpeg:rtsp://camera/main#video=copy"', config)
+        self.assertNotIn("front__source", config)
 
     def test_public_pipeline_is_managed_by_go2rtc_without_external_post(self):
         config = render({"video0": camera()})
-        self.assertIn("ffmpeg:video0__source#video=h264", config)
+        self.assertIn("ffmpeg:device?video=/dev/video0", config)
         self.assertNotIn("api/stream.ts", config)
         self.assertNotIn("__casaguard_wait", config)
 

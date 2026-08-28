@@ -11,12 +11,22 @@ esac
 
 wget -q "https://github.com/AlexxIT/go2rtc/releases/download/v1.9.9/go2rtc_linux_${asset}" -O /tmp/go2rtc
 chmod +x /tmp/go2rtc
+ffmpeg -y -v error -f lavfi -i testsrc=size=320x240:rate=10 -t 2 \
+  -c:v libx264 -pix_fmt yuv420p /tmp/casaguard-test.mp4
 /tmp/go2rtc -config /app/go2rtc-smoke.yaml >/tmp/go2rtc.log 2>&1 &
 go2rtc_pid=$!
 cleanup() {
+  status=$?
   kill "$go2rtc_pid" 2>/dev/null || true
   wait "$go2rtc_pid" 2>/dev/null || true
-  rm -f /tmp/go2rtc /tmp/go2rtc.log /tmp/day.json /tmp/night.json
+  if [ "$status" -ne 0 ]; then
+    echo "go2rtc API state:" >&2
+    wget -qO- http://127.0.0.1:1984/api/streams >&2 || true
+    echo "go2rtc log:" >&2
+    cat /tmp/go2rtc.log >&2 || true
+  fi
+  rm -f /tmp/go2rtc /tmp/go2rtc.log /tmp/day.json /tmp/night.json /tmp/casaguard-test.mp4
+  exit "$status"
 }
 trap cleanup EXIT
 

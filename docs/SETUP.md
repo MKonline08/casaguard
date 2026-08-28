@@ -81,7 +81,7 @@ Neither dashboard should be port-forwarded to the internet. Use a private VPN or
 
 ## Automatic day/night mode
 
-Every camera defaults to **Auto / Aggressive**. CasaGuard samples the hidden unfiltered stream every 10 seconds, enters Night after one minute below the dark threshold, and returns to Day after 30 seconds above the bright threshold. Very bright light restores Day within two samples. A five-minute dwell prevents rapid switching around either threshold.
+Every camera defaults to **Auto / Aggressive**. CasaGuard samples the camera's managed public stream every 10 seconds, enters Night after one minute below the dark threshold, and returns to Day after 30 seconds above the bright threshold. Very bright light restores Day within two samples. A five-minute dwell prevents rapid switching around either threshold.
 
 Use the camera-manager page on port `8971` to force Day or Night, select Gentle/Balanced/Aggressive enhancement, or tune the per-camera thresholds. The filter never changes the selected resolution or live FPS. Public streams are normal go2rtc-managed FFmpeg sources and exist as soon as Frigate loads its configuration; profile changes use a controlled Frigate reload so cameras cannot be lost to a startup race.
 

@@ -358,31 +358,19 @@ def camera_is_active(camera):
                 camera.get("status") in ("available", "configured"))
 
 
-def source_stream_name(camera):
-    return f"{slug(camera['name'])}__source"
-
-
-def raw_stream_source(camera):
+def camera_stream_source(camera, night_active=None):
+    night_active = bool(camera.get("night_active")) if night_active is None else bool(night_active)
     if camera["kind"] == "usb":
         input_format = camera.get("input_format", "mjpeg")
-        output = "copy" if input_format in ("h264", "mjpeg", "hevc") else "h264"
-        return (f'ffmpeg:device?video={camera["path"]}&input_format={camera.get("input_format", "mjpeg")}'
-                f'&video_size={camera.get("width", 640)}x{camera.get("height", 480)}'
-                f'&framerate={float(camera.get("fps", 5)):g}#video={output}')
-    return camera["path"]
-
-
-def public_stream_source(camera, night_active=None):
-    night_active = bool(camera.get("night_active")) if night_active is None else bool(night_active)
-    source = f"ffmpeg:{source_stream_name(camera)}"
-    hidden_is_h264 = camera.get("input_format") == "h264" or (
-        camera.get("kind") == "usb" and camera.get("input_format") not in ("mjpeg", "hevc"))
-    if not night_active and hidden_is_h264:
-        return source + "#video=copy"
+        source = (f'ffmpeg:device?video={camera["path"]}&input_format={input_format}'
+                  f'&video_size={camera.get("width", 640)}x{camera.get("height", 480)}'
+                  f'&framerate={float(camera.get("fps", 5)):g}')
+    else:
+        source = f'ffmpeg:{camera["path"]}'
     if night_active:
         strength = camera.get("night_strength", "aggressive")
         return source + f"#video=h264#raw=-vf {NIGHT_FILTERS.get(strength, NIGHT_FILTERS['aggressive'])}"
-    return source + "#video=h264"
+    return source + ("#video=copy" if camera.get("input_format") == "h264" else "#video=h264")
 
 
 def render(cameras):
@@ -391,9 +379,8 @@ def render(cameras):
              "  streams:" if enabled else "  streams: {}"]
     for camera in enabled:
         name = slug(camera["name"])
-        lines += [f"    {source_stream_name(camera)}:", f"      - {json.dumps(raw_stream_source(camera))}",
-                  f"    {name}: # CasaGuard profile: {'night' if camera.get('night_active') else 'day'}",
-                  f"      - {json.dumps(public_stream_source(camera))}"]
+        lines += [f"    {name}: # CasaGuard profile: {'night' if camera.get('night_active') else 'day'}",
+                  f"      - {json.dumps(camera_stream_source(camera))}"]
     if not enabled:
         lines.append("cameras: {}")
         return "\n".join(lines) + "\n"
@@ -434,7 +421,7 @@ def restart_frigate():
 
 
 def wait_camera_released(camera, timeout=30):
-    names = {source_stream_name(camera), slug(camera["name"])}
+    names = {slug(camera["name"])}
     started = time.monotonic()
     deadline = started + timeout
     saw_restart = False
@@ -475,7 +462,7 @@ def sample_luminance(camera, attempts=3):
     last_error = None
     for attempt in range(attempts):
         try:
-            return jpeg_luminance(fetch_frame(source_stream_name(camera)))
+            return jpeg_luminance(fetch_frame(slug(camera["name"])))
         except Exception as error:
             last_error = error
             if attempt + 1 < attempts:

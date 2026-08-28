@@ -3,9 +3,7 @@ api:
 rtsp:
   listen: "127.0.0.1:8554"
 streams:
-  test_source:
-    - "ffmpeg:testsrc=size=320x240:rate=10#input=-f lavfi -i {input}#video=h264"
   test_day:
-    - "ffmpeg:test_source#video=h264"
+    - "ffmpeg:/tmp/casaguard-test.mp4#input=-stream_loop -1 -re -i {input}#video=h264"
   test_night:
-    - "ffmpeg:test_source#video=h264#raw=-vf eq=brightness=0.08:contrast=1.12:gamma=1.75:saturation=0.90"
+    - "ffmpeg:/tmp/casaguard-test.mp4#input=-stream_loop -1 -re -i {input}#video=h264#raw=-vf eq=brightness=0.08:contrast=1.12:gamma=1.75:saturation=0.90"
