@@ -6,7 +6,7 @@ CasaGuard is a local multi-camera deployment for CasaOS. It discovers V4L2 USB c
 
 - A 64-bit Linux machine running CasaOS and Docker Compose v2
 - Any supported USB webcam, or an ONVIF/RTSP network camera
-- At least 100 GB free storage if you intend to keep the configured seven-day continuous recording window
+- Enough free storage for the configured 30-day alert and detection retention window
 - A modern two-core-or-better CPU; the included profile targets an AMD Ryzen laptop with 8 GB RAM and no GPU
 
 > [!IMPORTANT]
@@ -16,10 +16,10 @@ CasaGuard is a local multi-camera deployment for CasaOS. It discovers V4L2 USB c
 
 1. Copy this repository onto the CasaOS host, then open its directory in a terminal.
 2. Run `cp .env.example .env` and edit `TZ` to your IANA timezone, such as `America/Chicago`.
-3. Run `./scripts/camera-test.sh`. It must capture a frame at 640×480 before you continue.
+3. If a USB camera is connected, run `./scripts/camera-test.sh` to confirm the host can capture it. Zero-camera startup is also supported.
 4. In CasaOS, select **App Store** → **Custom Install** → **Import** and choose **Docker Compose**.
 5. Paste the complete contents of `docker-compose.yml` and select **Submit**.
-6. Open `http://YOUR-CASAOS-IP:8971` to review discovered cameras or add an authenticated RTSP URL.
+6. Open `http://YOUR-CASAOS-IP:8971` to review discovered cameras, configure automatic day/night behavior, or add an authenticated RTSP URL.
 7. Start the app. Go to `http://CASAOS-IP:5000` and set the Frigate account password when prompted.
 8. Go to `http://CASAOS-IP:32168` and verify CodeProject.AI reports healthy.
 
@@ -44,7 +44,7 @@ cp .env.example .env
 nano .env
 ./scripts/camera-test.sh /dev/video0
 docker compose pull
-docker compose build webhook-relay
+docker compose build camera-manager webhook-relay
 docker compose up -d
 docker compose ps
 ```
@@ -53,6 +53,7 @@ Useful status commands:
 
 ```bash
 docker compose logs -f frigate
+docker compose logs -f camera-manager
 docker compose logs -f codeproject-ai
 docker compose logs -f webhook-relay
 ```
@@ -71,11 +72,18 @@ Do **not** run `docker compose down -v` unless you intentionally want to delete 
 |---:|---|---|---|
 | `5000` | Frigate | UI and REST API | LAN only |
 | `8971` | Camera manager | USB/ONVIF discovery and RTSP setup | LAN only |
+| `1984` | go2rtc local API | Camera ingest and light sampling | Loopback only; never expose |
 | `8554` | Frigate/go2rtc | RTSP restream | LAN only; firewall if unused |
 | `8555/tcp,udp` | Frigate/go2rtc | WebRTC | LAN only |
 | `32168` | CodeProject.AI | Dashboard and REST API | LAN only |
 
 Neither dashboard should be port-forwarded to the internet. Use a private VPN or a carefully configured reverse proxy with HTTPS and strong authentication for remote access.
+
+## Automatic day/night mode
+
+Every camera defaults to **Auto / Aggressive**. CasaGuard samples the hidden unfiltered stream every 10 seconds, enters Night after one minute below the dark threshold, and returns to Day after 30 seconds above the bright threshold. Very bright light restores Day within two samples. A five-minute dwell prevents rapid switching around either threshold.
+
+Use the camera-manager page on port `8971` to force Day or Night, select Gentle/Balanced/Aggressive enhancement, or tune the per-camera thresholds. The filter never changes native resolution or live FPS. CasaGuard keeps the hidden native capture running and replaces only the affected camera's public output pipeline. If that replacement cannot be verified, it preserves the requested mode and asks Frigate for one controlled recovery restart.
 
 ## Storage and backup
 
@@ -85,7 +93,7 @@ Docker named volumes hold durable data:
 docker volume ls | grep casaguard
 ```
 
-Frigate continuous recordings have seven days of retention; event recordings have 30 days. For a backup, stop the stack and archive the named volumes using your normal CasaOS backup method. Back up any enrolled face images and custom models separately.
+Frigate alert and detection recordings have 30 days of retention. For a backup, stop the stack and archive the named volumes using your normal CasaOS backup method. Back up any enrolled face images and custom models separately.
 
 ## Optional generic webhook
 

@@ -13,6 +13,9 @@ detectors:
     type: cpu
     num_threads: 2
 
+detect:
+  enabled: true
+
 objects:
   track:
     - person

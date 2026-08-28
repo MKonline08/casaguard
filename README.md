@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/CasaOS-compatible-00A6A6?style=for-the-badge" alt="CasaOS compatible">
 </p>
 
-<p align="center"><strong>Private, local-first security for USB, ONVIF, and RTSP cameras.</strong><br>Automatic discovery • native-quality live feeds • no cloud account • Docker Compose</p>
+<p align="center"><strong>Private, local-first security for USB, ONVIF, and RTSP cameras.</strong><br>Automatic discovery • automatic day/night enhancement • native-quality live feeds • no cloud account • Docker Compose</p>
 
 ```
    _____                 ____                     _
@@ -27,6 +27,7 @@
 | | Capability | What it does locally |
 |---:|---|---|
 | 🔒 | **Person detection** | Alerts on people and retains a 30-day event record. |
+| 🌙 | **Automatic night mode** | Measures each camera independently and switches a native-resolution low-light filter on or off without restarting Frigate. |
 | 👤 | **Face recognition** | Optional known-face matching in CodeProject.AI. |
 | 🎵 | **Audio alerts** | Optional sound classification after a microphone is configured. |
 | 📱 | **Mobile notifications** | Frigate browser notifications; use its API with Home Assistant/ntfy for phone delivery. |
@@ -42,7 +43,7 @@ cd casaguard
 chmod +x scripts/*.sh && ./scripts/install.sh
 ```
 
-Open `http://YOUR-CASAOS-IP:8971` to review discovered cameras, then open `http://YOUR-CASAOS-IP:5000` to finish Frigate’s first-run administrator setup. The first CodeProject.AI start can take several minutes while it initializes.
+Open `http://YOUR-CASAOS-IP:8971` to review discovered cameras and their Auto/Day/Night controls, then open `http://YOUR-CASAOS-IP:5000` to finish Frigate’s first-run administrator setup. The first CodeProject.AI start can take several minutes while it initializes.
 
 ### Quick start — three commands
 
@@ -82,10 +83,10 @@ Frigate and CodeProject.AI are intentionally separate services: Frigate owns rea
 | CPU | 2 modern cores | **AMD Ryzen laptop — ✅ Tested & Verified profile** |
 | Memory | 4 GB | **8 GB — ✅ Tested & Verified profile** |
 | Camera | V4L2 USB or ONVIF/RTSP network camera | Multiple cameras supported |
-| Storage | 20 GB free | 100 GB+ recommended for seven days of continuous video |
+| Storage | 20 GB free | 100 GB+ recommended; actual use depends on 30-day event activity |
 | GPU | Not required | **No GPU acceleration used** |
 
-The `1.5 GB` Frigate and `1 GB` CodeProject.AI ceilings preserve memory for CasaOS. Face/audio workloads are bursty; avoid running both continuously on an 8 GB system.
+The `3 GB` Frigate and `1 GB` CodeProject.AI ceilings preserve memory for CasaOS. Face/audio workloads are bursty; avoid running every optional module continuously on an 8 GB system.
 
 ## CasaGuard vs. cloud cameras
 
@@ -103,6 +104,7 @@ The `1.5 GB` Frigate and `1 GB` CodeProject.AI ceilings preserve memory for Casa
 |---|---:|---|
 | Frigate | `5000` | NVR UI and API |
 | Camera manager | `8971` | Discovery, native mode details, and RTSP setup |
+| go2rtc local API | `1984` | Loopback-only camera ingest and light sampling |
 | go2rtc | `8554`, `8555` | Local RTSP / WebRTC live view |
 | CodeProject.AI | `32168` | Dashboard and REST API |
 

@@ -33,8 +33,8 @@ done
 info "Pulling CPU-only images (the CodeProject.AI image is large on first pull)..."
 "${COMPOSE[@]}" pull frigate codeproject-ai
 
-info "Building the local person-event webhook relay..."
-"${COMPOSE[@]}" build webhook-relay
+info "Building and testing the local camera manager and person-event webhook relay..."
+"${COMPOSE[@]}" build camera-manager webhook-relay
 
 info "Starting CasaGuard..."
 "${COMPOSE[@]}" up -d
@@ -45,6 +45,7 @@ cat <<EOF
 
 CasaGuard is starting. Give the AI server a few minutes on its first run.
 Frigate:        http://${HOST_IP}:$(grep '^FRIGATE_PORT=' .env | cut -d= -f2)
+Camera manager: http://${HOST_IP}:8971
 CodeProject.AI: http://${HOST_IP}:$(grep '^CPAI_PORT=' .env | cut -d= -f2)
 
 Set the Frigate administrator password on the first browser visit.

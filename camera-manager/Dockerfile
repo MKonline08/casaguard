@@ -1,5 +1,6 @@
 FROM python:3.12-alpine
 RUN apk add --no-cache v4l-utils ffmpeg
+RUN ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libx264
 WORKDIR /app
 COPY manager.py .
 COPY test_manager.py .
