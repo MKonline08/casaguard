@@ -562,21 +562,32 @@ def apply_selected_mode(camera, selected):
     camera["width"], camera["height"], camera["fps"], camera["input_format"] = mode_tuple(selected)
 
 
+def camera_requires_validation(camera, force=False):
+    if camera.get("kind") != "usb" or camera.get("status") == "offline":
+        return False
+    if force:
+        return True
+    current_hash = camera.get("capabilities_hash", "")
+    if (camera.get("validation_status") == "failed" and
+            camera.get("mode_validation_version") == MODE_VALIDATION_VERSION and
+            camera.get("validated_capabilities_hash") == current_hash):
+        return False
+    return not (camera.get("validation_status") == "verified" and
+                camera.get("mode_validation_version") == MODE_VALIDATION_VERSION and
+                camera.get("validated_capabilities_hash") == current_hash and
+                selected_mode_is_available(camera))
+
+
 def verify_usb_camera(camera, force=False, validator=validate_usb_mode, downgrade=False):
     if camera.get("kind") != "usb" or camera.get("status") == "offline":
         return False
     current_hash = camera.get("capabilities_hash", "")
-    if (not force and camera.get("validation_status") == "failed" and
-            camera.get("mode_validation_version") == MODE_VALIDATION_VERSION and
-            camera.get("validated_capabilities_hash") == current_hash):
-        camera["status"] = "unhealthy"
-        return False
-    if (not force and camera.get("validation_status") == "verified" and
-            camera.get("mode_validation_version") == MODE_VALIDATION_VERSION and
-            camera.get("validated_capabilities_hash") == current_hash and
-            selected_mode_is_available(camera)):
-        apply_selected_mode(camera, camera["selected_mode"])
-        camera["status"] = "available"
+    if not camera_requires_validation(camera, force):
+        if camera.get("validation_status") == "verified" and camera.get("selected_mode"):
+            apply_selected_mode(camera, camera["selected_mode"])
+            camera["status"] = "available"
+        elif camera.get("validation_status") == "failed":
+            camera["status"] = "unhealthy"
         return False
     camera_id = camera["id"]
     MODE_VALIDATION.add(camera_id)
@@ -603,11 +614,13 @@ def verify_usb_camera(camera, force=False, validator=validate_usb_mode, downgrad
         MODE_VALIDATION.discard(camera_id)
 
 
-def verify_usb_cameras(cameras, force_ids=None, validator=validate_usb_mode):
+def verify_usb_cameras(cameras, force_ids=None, validator=validate_usb_mode, skip_ids=None):
     force_ids = set(force_ids or ())
+    skip_ids = set(skip_ids or ())
     changed = False
     for camera_id, camera in cameras.items():
-        if camera.get("kind") == "usb" and camera.get("status") != "offline":
+        if (camera_id not in skip_ids and camera.get("kind") == "usb" and
+                camera.get("status") != "offline"):
             changed = verify_usb_camera(camera, camera_id in force_ids, validator) or changed
     return changed
 
@@ -641,7 +654,8 @@ def merge_usb_state(cameras, discovered):
     return result
 
 
-def scan(restart=True, force_ids=None):
+def scan(restart=True, force_ids=None, validator=validate_usb_mode):
+    force_ids = set(force_ids or ())
     with LOCK:
         discovered_usb = discover_usb()
         cameras = merge_usb_state(load_state(), discovered_usb)
@@ -651,7 +665,30 @@ def scan(restart=True, force_ids=None):
                 camera["status"] = "offline"
         for discovered in discover_onvif():
             cameras.setdefault(discovered["id"], discovered)
-        verify_usb_cameras(cameras, force_ids=force_ids)
+        # A separately restarted manager may find Frigate still holding previously configured
+        # devices. Release only cameras that truly require validation before opening V4L2.
+        running = fetch_frigate_camera_stats() is not None
+        release = [camera for camera_id, camera in cameras.items()
+                   if running and camera.get("selected_mode") and
+                   camera_requires_validation(camera, camera_id in force_ids)]
+        skipped = set()
+        if release:
+            for camera in release:
+                camera["status"] = "validating"
+            save_state(cameras)
+            changed_for_release = write_config(cameras)
+            released = bool(restart and (not changed_for_release or restart_frigate()))
+            if released:
+                released = all(wait_camera_released(camera) for camera in release)
+            if not released:
+                for camera in release:
+                    camera["status"] = "available" if camera.get("selected_mode") else "unhealthy"
+                    camera["fallback_reason"] = "Mode validation deferred because Frigate did not release the device"
+                    skipped.add(camera["id"])
+                save_state(cameras)
+                if write_config(cameras) and restart:
+                    restart_frigate()
+        verify_usb_cameras(cameras, force_ids=force_ids, validator=validator, skip_ids=skipped)
         save_state(cameras)
         changed = write_config(cameras)
     if changed and restart:

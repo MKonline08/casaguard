@@ -25,10 +25,12 @@ from manager import (
     parse_v4l2_groups,
     public_state,
     camera_stream_source,
+    camera_requires_validation,
     ranked_modes,
     recover_usb_pipeline,
     render,
     sample_luminance,
+    scan,
     select_verified_mode,
     usb_identity,
     validate_usb_mode,
@@ -155,6 +157,25 @@ class NativeModeTests(unittest.TestCase):
         self.assertFalse(verify_usb_camera(value, validator=validator))
         validator.assert_not_called()
         self.assertEqual("unhealthy", value["status"])
+
+    def test_changed_validator_requires_retest_of_saved_mode(self):
+        modes = parse_modes(self.MODES)
+        digest = capabilities_hash(modes)
+        value = camera(
+            available_modes=modes, capabilities_hash=digest, validated_capabilities_hash=digest,
+            selected_mode=modes[-1], validation_status="verified",
+            mode_validation_version=MODE_VALIDATION_VERSION - 1)
+        self.assertTrue(camera_requires_validation(value))
+
+    def test_current_verified_mode_does_not_require_device_reopen(self):
+        modes = parse_modes(self.MODES)
+        digest = capabilities_hash(modes)
+        selected = ranked_modes(modes)[0]
+        value = camera(
+            available_modes=modes, capabilities_hash=digest, validated_capabilities_hash=digest,
+            selected_mode=selected, validation_status="verified",
+            mode_validation_version=MODE_VALIDATION_VERSION)
+        self.assertFalse(camera_requires_validation(value))
 
     def test_runtime_downgrade_starts_after_current_mode(self):
         modes = parse_modes(self.MODES)
@@ -457,6 +478,30 @@ class ApiAndRecoveryTests(unittest.TestCase):
         self.assertIn("Automatic downgrade", state["bad"]["fallback_reason"])
         self.assertEqual(2, restart.call_count)
         wait.assert_called_once()
+
+    def test_manager_restart_releases_owned_camera_before_validation(self):
+        modes = parse_modes(NativeModeTests.MODES)
+        digest = capabilities_hash(modes)
+        selected = ranked_modes(modes, {"vendor": "046d", "product": "0825"})[0]
+        saved = camera(
+            id="usb_cam", name="uvc_camera", available_modes=modes, capabilities_hash=digest,
+            validated_capabilities_hash=digest, selected_mode=selected, validation_status="verified",
+            mode_validation_version=MODE_VALIDATION_VERSION - 1)
+        discovered = camera(
+            id="usb_cam", name="uvc_camera", available_modes=modes, capabilities_hash=digest,
+            usb_attributes={"vendor": "046d", "product": "0825"})
+        with patch("manager.discover_usb", return_value=[discovered]), \
+                patch("manager.load_state", return_value={"usb_cam": saved}), \
+                patch("manager.discover_onvif", return_value=[]), \
+                patch("manager.fetch_frigate_camera_stats", return_value={"uvc_camera": {"camera_fps": 5}}), \
+                patch("manager.save_state"), patch("manager.write_config", return_value=True), \
+                patch("manager.restart_frigate", return_value=True) as restart, \
+                patch("manager.wait_camera_released", return_value=True) as released:
+            result = scan(validator=lambda *_: (True, ""))
+        self.assertEqual("available", result["usb_cam"]["status"])
+        self.assertEqual(MODE_VALIDATION_VERSION, result["usb_cam"]["mode_validation_version"])
+        self.assertEqual(2, restart.call_count)
+        released.assert_called_once()
 
     def tearDown(self):
         RUNTIME.clear()
