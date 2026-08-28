@@ -19,10 +19,12 @@ from manager import (
     merge_usb_state,
     monitor_once,
     parse_v4l2_groups,
+    placeholder_stream_source,
     public_state,
     public_worker_command,
     replace_public_worker,
     render,
+    sample_luminance,
     usb_identity,
     with_night_defaults,
 )
@@ -82,14 +84,15 @@ class RenderTests(unittest.TestCase):
         config = render({"video0": camera()})
         self.assertIn("video0__source:", config)
         self.assertIn("input_format=mjpeg&video_size=1920x1080&framerate=30#video=copy", config)
-        self.assertIn("video0: [] # CasaGuard profile: day", config)
+        self.assertIn("video0: # CasaGuard profile: day", config)
+        self.assertIn("rtsp://127.0.0.1:8554/__casaguard_wait_video0", config)
         self.assertIn("fps: 5", config)
         self.assertIn("enabled: true", config)
         self.assertIn("Native: video0", config)
 
     def test_night_filter_is_aggressive_without_scaling_or_fps_change(self):
         config = render({"video0": camera(night_active=True)})
-        self.assertIn("video0: [] # CasaGuard profile: night", config)
+        self.assertIn("video0: # CasaGuard profile: night", config)
         self.assertIn("video_size=1920x1080&framerate=30", config)
         command = " ".join(public_worker_command(camera(night_active=True)))
         self.assertIn(NIGHT_FILTERS["aggressive"], command)
@@ -109,7 +112,12 @@ class RenderTests(unittest.TestCase):
         value = camera(kind="network", path="rtsp://camera/main", name="front", input_format="h264")
         config = render({"front": value})
         self.assertIn('front__source:\n      - "rtsp://camera/main"', config)
-        self.assertIn("front: [] # CasaGuard profile: day", config)
+        self.assertIn("front: # CasaGuard profile: day", config)
+
+    def test_public_placeholder_is_loopback_rtsp_not_exec(self):
+        source = placeholder_stream_source(camera())
+        self.assertEqual("rtsp://127.0.0.1:8554/__casaguard_wait_video0", source)
+        self.assertNotRegex(source, r"(?:exec|echo|expr):")
 
     def test_public_pipeline_posts_to_loopback_go2rtc(self):
         command = public_worker_command(camera())
@@ -186,6 +194,14 @@ class LuminanceTests(unittest.TestCase):
     def test_synthetic_dark_and_bright_frames(self):
         self.assertLess(jpeg_luminance(self.frame("black")), 30)
         self.assertGreater(jpeg_luminance(self.frame("white")), 220)
+
+    @patch("manager.time.sleep")
+    @patch("manager.jpeg_luminance", side_effect=[RuntimeError("truncated"), 73])
+    @patch("manager.fetch_frame", return_value=b"jpeg")
+    def test_transient_frame_decode_is_retried(self, _, luminance, sleep):
+        self.assertEqual(73, sample_luminance(camera()))
+        self.assertEqual(2, luminance.call_count)
+        sleep.assert_called_once_with(0.25)
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg tools are required")
     def test_night_filter_keeps_native_dimensions_and_fps(self):
