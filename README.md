@@ -27,7 +27,7 @@
 | | Capability | What it does locally |
 |---:|---|---|
 | 🔒 | **Person detection** | Alerts on people and retains a 30-day event record. |
-| 🌙 | **Automatic night mode** | Measures each camera independently and switches a native-resolution low-light filter on or off without restarting Frigate. |
+| 🌙 | **Automatic night mode** | Measures each camera independently and applies a native-resolution low-light filter with a controlled Frigate reload. |
 | 👤 | **Face recognition** | Optional known-face matching in CodeProject.AI. |
 | 🎵 | **Audio alerts** | Optional sound classification after a microphone is configured. |
 | 📱 | **Mobile notifications** | Frigate browser notifications; use its API with Home Assistant/ntfy for phone delivery. |

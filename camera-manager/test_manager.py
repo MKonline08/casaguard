@@ -8,12 +8,11 @@ from unittest.mock import Mock, patch
 
 from manager import (
     NIGHT_FILTERS,
-    PUBLIC_WORKERS,
+    MODE_VALIDATION_VERSION,
     RUNTIME,
     apply_stream_state,
     best_mode,
     capabilities_hash,
-    encoder_args,
     evaluate_light,
     is_capture_node,
     jpeg_luminance,
@@ -21,16 +20,14 @@ from manager import (
     monitor_once,
     parse_modes,
     parse_v4l2_groups,
-    placeholder_stream_source,
     public_state,
-    public_worker_command,
+    public_stream_source,
     ranked_modes,
-    replace_public_worker,
     render,
     sample_luminance,
     select_verified_mode,
-    supervise_workers_once,
     usb_identity,
+    validate_usb_mode,
     verify_usb_camera,
     with_night_defaults,
 )
@@ -102,11 +99,23 @@ class NativeModeTests(unittest.TestCase):
         value = camera(id="usb_cam", kind="usb", available_modes=modes, selected_mode=selected,
                        capabilities_hash=capabilities_hash(modes),
                        validated_capabilities_hash=capabilities_hash(modes), validation_status="verified")
+        value["mode_validation_version"] = MODE_VALIDATION_VERSION
         validator = Mock(side_effect=AssertionError("healthy mode should not be retested"))
         self.assertFalse(verify_usb_camera(value, validator=validator))
         validator.assert_not_called()
         self.assertEqual((1280, 720, 30.0, "mjpeg"),
                          (value["width"], value["height"], value["fps"], value["input_format"]))
+
+    def test_old_validation_version_is_retested_after_decoder_fix(self):
+        modes = parse_modes(self.MODES)
+        value = camera(id="usb_cam", kind="usb", available_modes=modes,
+                       selected_mode=modes[-1], capabilities_hash=capabilities_hash(modes),
+                       validated_capabilities_hash=capabilities_hash(modes), validation_status="verified",
+                       mode_validation_version=MODE_VALIDATION_VERSION - 1, usb_attributes={})
+        validator = Mock(return_value=(True, ""))
+        self.assertTrue(verify_usb_camera(value, validator=validator))
+        validator.assert_called()
+        self.assertEqual(MODE_VALIDATION_VERSION, value["mode_validation_version"])
 
     def test_all_failed_modes_mark_only_camera_unhealthy(self):
         modes = parse_modes(self.MODES)
@@ -152,7 +161,8 @@ class RenderTests(unittest.TestCase):
         self.assertIn("video0__source:", config)
         self.assertIn("input_format=mjpeg&video_size=1920x1080&framerate=30#video=copy", config)
         self.assertIn("video0: # CasaGuard profile: day", config)
-        self.assertIn("rtsp://127.0.0.1:8554/__casaguard_wait_video0", config)
+        self.assertIn('"ffmpeg:video0__source#video=h264"', config)
+        self.assertNotIn("__casaguard_wait", config)
         self.assertIn("fps: 5", config)
         self.assertIn("enabled: true", config)
         self.assertIn("Native: video0", config)
@@ -161,19 +171,21 @@ class RenderTests(unittest.TestCase):
         config = render({"video0": camera(night_active=True)})
         self.assertIn("video0: # CasaGuard profile: night", config)
         self.assertIn("video_size=1920x1080&framerate=30", config)
-        command = " ".join(public_worker_command(camera(night_active=True)))
-        self.assertIn(NIGHT_FILTERS["aggressive"], command)
-        self.assertNotIn("scale=", command)
-        self.assertNotIn("-r ", command)
+        source = public_stream_source(camera(night_active=True))
+        self.assertIn(NIGHT_FILTERS["aggressive"], source)
+        self.assertNotIn("scale=", source)
+        self.assertNotIn("-r ", source)
 
     def test_native_h264_day_mode_is_copied(self):
         config = render({"video0": camera(input_format="h264")})
         self.assertIn("input_format=h264", config)
-        self.assertEqual(["-c:v", "copy"], encoder_args(camera(input_format="h264")))
+        self.assertEqual("ffmpeg:video0__source#video=copy", public_stream_source(camera(input_format="h264")))
 
     def test_raw_usb_format_is_encoded_without_resizing(self):
         config = render({"video0": camera(input_format="yuyv422")})
         self.assertIn("input_format=yuyv422&video_size=1920x1080&framerate=30#video=h264", config)
+        self.assertEqual("ffmpeg:video0__source#video=copy",
+                         public_stream_source(camera(input_format="yuyv422")))
 
     def test_network_camera_uses_hidden_source(self):
         value = camera(kind="network", path="rtsp://camera/main", name="front", input_format="h264")
@@ -181,16 +193,11 @@ class RenderTests(unittest.TestCase):
         self.assertIn('front__source:\n      - "rtsp://camera/main"', config)
         self.assertIn("front: # CasaGuard profile: day", config)
 
-    def test_public_placeholder_is_loopback_rtsp_not_exec(self):
-        source = placeholder_stream_source(camera())
-        self.assertEqual("rtsp://127.0.0.1:8554/__casaguard_wait_video0", source)
-        self.assertNotRegex(source, r"(?:exec|echo|expr):")
-
-    def test_public_pipeline_posts_to_loopback_go2rtc(self):
-        command = public_worker_command(camera())
-        self.assertIn("rtsp://127.0.0.1:8554/video0__source", command)
-        self.assertIn("http://127.0.0.1:1984/api/stream.ts?dst=video0", command)
-        self.assertEqual("POST", command[command.index("-method") + 1])
+    def test_public_pipeline_is_managed_by_go2rtc_without_external_post(self):
+        config = render({"video0": camera()})
+        self.assertIn("ffmpeg:video0__source#video=h264", config)
+        self.assertNotIn("api/stream.ts", config)
+        self.assertNotIn("__casaguard_wait", config)
 
     def test_offline_camera_is_not_rendered(self):
         self.assertIn("cameras: {}", render({"old": camera(status="offline")}))
@@ -329,60 +336,28 @@ class ApiAndRecoveryTests(unittest.TestCase):
         state = public_state({"front": {"path": "rtsp://admin:secret@192.168.1.20/live"}})
         self.assertEqual("rtsp://***:***@192.168.1.20/live", state["front"]["path"])
 
-    class FakeProcess:
-        pid = 123
-        returncode = None
-
-        def poll(self):
-            return self.returncode
-
-        def terminate(self):
-            self.returncode = 0
-
-        def wait(self, timeout=None):
-            return self.returncode
-
     def tearDown(self):
-        PUBLIC_WORKERS.clear()
         RUNTIME.clear()
 
-    @patch("manager.fetch_frame", return_value=b"jpeg")
-    @patch("manager.subprocess.Popen")
-    def test_live_switch_replaces_only_public_pipeline_and_verifies_frame(self, popen, frame):
-        old = self.FakeProcess()
-        PUBLIC_WORKERS["video0"] = {"process": old, "signature": ("old",)}
-        new = self.FakeProcess()
-        popen.return_value = new
-        replace_public_worker("video0", camera(night_active=True))
-        self.assertEqual(0, old.returncode)
-        command = popen.call_args.args[0]
-        self.assertIn(NIGHT_FILTERS["aggressive"], command)
-        frame.assert_called_once_with("video0", timeout=4)
-
     @patch("manager.save_state")
-    @patch("manager.write_config")
+    @patch("manager.write_config", return_value=True)
     @patch("manager.restart_frigate", return_value=True)
-    @patch("manager.replace_public_worker", side_effect=RuntimeError("offline"))
-    def test_failed_live_switch_falls_back_to_frigate_restart(self, _, restart, __, ___):
+    def test_profile_change_writes_config_and_restarts_frigate(self, restart, _, save):
         cameras = {"video0": camera()}
         self.assertTrue(apply_stream_state(cameras, "video0", True, "test"))
         restart.assert_called_once()
-        self.assertIn("live switch failed", cameras["video0"]["night_error"])
+        self.assertTrue(cameras["video0"]["night_active"])
+        self.assertEqual("", cameras["video0"]["night_error"])
+        self.assertGreaterEqual(save.call_count, 2)
 
-    @patch("manager.scan")
-    @patch("manager.start_public_worker")
-    @patch("manager.load_state")
-    def test_three_pipeline_failures_trigger_one_debounced_mode_retest(self, load, _, scan):
-        load.return_value = {"video0": camera(kind="usb")}
-        for _ in range(3):
-            failed = self.FakeProcess()
-            failed.returncode = 1
-            PUBLIC_WORKERS["video0"] = {
-                "process": failed, "signature": ("old",), "started": 0,
-                "errors": ["Invalid data found when processing input"],
-            }
-            supervise_workers_once()
-        scan.assert_called_once_with(restart=True, force_ids={"video0"})
+    @patch("manager.subprocess.run")
+    def test_zero_exit_malformed_mjpeg_is_rejected(self, run):
+        run.return_value = subprocess.CompletedProcess(
+            [], 0, stderr="unable to decode APP fields: Invalid data found when processing input")
+        valid, error = validate_usb_mode("/dev/video0", {
+            "width": 1280, "height": 720, "fps": 30, "input_format": "mjpeg"})
+        self.assertFalse(valid)
+        self.assertIn("Invalid data found", error)
 
 
 class DiscoveryTests(unittest.TestCase):

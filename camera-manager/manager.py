@@ -9,7 +9,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
-from collections import Counter, deque
+from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from xml.etree import ElementTree
@@ -23,10 +23,9 @@ SCAN_SECONDS = max(10, int(os.getenv("SCAN_SECONDS", "30")))
 LIGHT_SCAN_SECONDS = max(5, int(os.getenv("LIGHT_SCAN_SECONDS", "10")))
 
 LOCK = threading.RLock()
-WORKER_LOCK = threading.RLock()
 RUNTIME = {}
-PUBLIC_WORKERS = {}
 MODE_VALIDATION = set()
+MODE_VALIDATION_VERSION = 2
 
 FORMATS = {"H264": "h264", "MJPG": "mjpeg", "JPEG": "mjpeg", "HEVC": "hevc", "YUYV": "yuyv422", "NV12": "nv12"}
 PRIORITY = {"h264": 4, "mjpeg": 3, "hevc": 2, "nv12": 1, "yuyv422": 0}
@@ -42,7 +41,7 @@ DEFAULT_NIGHT = {
 PRESERVED_FIELDS = (
     "name", "enabled", "night_mode", "night_strength", "dark_threshold", "bright_threshold",
     "night_active", "last_transition", "night_error", "selected_mode", "validation_status",
-    "fallback_reason", "last_mode_validation", "validated_capabilities_hash",
+    "fallback_reason", "last_mode_validation", "validated_capabilities_hash", "mode_validation_version",
 )
 
 KNOWN_USB_LIMITS = {
@@ -148,7 +147,12 @@ def validate_usb_mode(path, mode, timeout=5):
     except subprocess.TimeoutExpired:
         return False, "validation timed out"
     error = re.sub(r"\s+", " ", result.stderr or "").strip()[-600:]
-    if result.returncode:
+    corrupt = re.search(
+        r"unable to decode APP fields|Invalid data found when processing input|corrupt(?:ed)?|"
+        r"error while decoding|overread|No space left on device|Input/output error",
+        result.stderr or "", re.IGNORECASE,
+    )
+    if result.returncode or corrupt:
         return False, error or f"FFmpeg exited with status {result.returncode}"
     return True, ""
 
@@ -329,19 +333,23 @@ def save_state(cameras):
 
 def public_state(cameras):
     safe = json.loads(json.dumps(cameras))
+    try:
+        with urllib.request.urlopen(f"{GO2RTC_URL}/api/streams", timeout=1) as response:
+            streams = json.load(response)
+    except Exception:
+        streams = {}
     for camera_id, camera in safe.items():
         camera["path"] = re.sub(r"(?<=://)[^/@]+@", "***:***@", camera.get("path", ""))
         for private in ("stable_hardware_id", "usb_attributes", "available_modes", "capabilities_hash",
-                        "validated_capabilities_hash"):
+                        "validated_capabilities_hash", "mode_validation_version"):
             camera.pop(private, None)
         runtime = RUNTIME.get(camera_id, {})
         camera["luminance"] = runtime.get("luminance")
         camera["night_status"] = runtime.get("status", "starting")
         camera["last_sample"] = runtime.get("last_sample", 0)
         camera["monitor_error"] = runtime.get("error", "")
-        camera["pipeline_error"] = runtime.get("worker_error", "")
-        worker = PUBLIC_WORKERS.get(camera_id)
-        camera["pipeline_running"] = bool(worker and worker["process"].poll() is None)
+        camera["pipeline_error"] = runtime.get("pipeline_error", "")
+        camera["pipeline_running"] = slug(camera.get("name", camera_id)) in streams
     return safe
 
 
@@ -364,11 +372,17 @@ def raw_stream_source(camera):
     return camera["path"]
 
 
-def placeholder_stream_source(camera):
-    # Frigate removes source-less go2rtc streams during its security pass. A loopback RTSP
-    # placeholder is safe (no shell/exec capability) and keeps the destination registered until
-    # the manager attaches the real external producer through go2rtc's local ingest API.
-    return f"rtsp://127.0.0.1:8554/__casaguard_wait_{slug(camera['name'])}"
+def public_stream_source(camera, night_active=None):
+    night_active = bool(camera.get("night_active")) if night_active is None else bool(night_active)
+    source = f"ffmpeg:{source_stream_name(camera)}"
+    hidden_is_h264 = camera.get("input_format") == "h264" or (
+        camera.get("kind") == "usb" and camera.get("input_format") not in ("mjpeg", "hevc"))
+    if not night_active and hidden_is_h264:
+        return source + "#video=copy"
+    if night_active:
+        strength = camera.get("night_strength", "aggressive")
+        return source + f"#video=h264#raw=-vf {NIGHT_FILTERS.get(strength, NIGHT_FILTERS['aggressive'])}"
+    return source + "#video=h264"
 
 
 def render(cameras):
@@ -379,7 +393,7 @@ def render(cameras):
         name = slug(camera["name"])
         lines += [f"    {source_stream_name(camera)}:", f"      - {json.dumps(raw_stream_source(camera))}",
                   f"    {name}: # CasaGuard profile: {'night' if camera.get('night_active') else 'day'}",
-                  f"      - {json.dumps(placeholder_stream_source(camera))}"]
+                  f"      - {json.dumps(public_stream_source(camera))}"]
     if not enabled:
         lines.append("cameras: {}")
         return "\n".join(lines) + "\n"
@@ -417,6 +431,24 @@ def restart_frigate():
         return True
     except Exception:
         return False
+
+
+def wait_camera_released(camera, timeout=30):
+    names = {source_stream_name(camera), slug(camera["name"])}
+    started = time.monotonic()
+    deadline = started + timeout
+    saw_restart = False
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"{GO2RTC_URL}/api/streams", timeout=2) as response:
+                streams = json.load(response)
+            if names.isdisjoint(streams) and (saw_restart or time.monotonic() - started >= 3):
+                time.sleep(1)
+                return True
+        except Exception:
+            saw_restart = True
+        time.sleep(1)
+    return False
 
 
 def fetch_frame(stream_name, timeout=10):
@@ -476,142 +508,6 @@ def evaluate_light(camera, luminance, runtime, now=None):
     return None
 
 
-def encoder_args(camera, night_active=None):
-    night_active = bool(camera.get("night_active")) if night_active is None else bool(night_active)
-    if not night_active and camera.get("input_format") == "h264":
-        return ["-c:v", "copy"]
-    args = []
-    if night_active:
-        strength = camera.get("night_strength", "aggressive")
-        args += ["-vf", NIGHT_FILTERS.get(strength, NIGHT_FILTERS["aggressive"])]
-    return args + ["-c:v", "libx264", "-preset", "superfast", "-tune", "zerolatency",
-                   "-profile:v", "high", "-level:v", "4.1", "-pix_fmt", "yuv420p",
-                   "-g", str(max(1, round(float(camera.get("fps", 5)) * 2)))]
-
-
-def public_worker_command(camera):
-    source = urllib.parse.quote(source_stream_name(camera), safe="")
-    destination = urllib.parse.quote(slug(camera["name"]), safe="")
-    return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-xerror", "-nostdin", "-rtsp_transport", "tcp",
-            "-i", f"rtsp://127.0.0.1:8554/{source}", "-map", "0:v:0", "-an",
-            *encoder_args(camera), "-f", "mpegts", "-method", "POST",
-            f"{GO2RTC_URL}/api/stream.ts?dst={destination}"]
-
-
-def worker_signature(camera):
-    return (source_stream_name(camera), slug(camera["name"]), camera.get("input_format"),
-            int(camera.get("width", 640)), int(camera.get("height", 480)),
-            float(camera.get("fps", 5)), bool(camera.get("night_active")), camera.get("night_strength"))
-
-
-def stop_public_worker(camera_id):
-    entry = PUBLIC_WORKERS.pop(camera_id, None)
-    if not entry:
-        return
-    process = entry["process"]
-    if process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=2)
-
-
-def capture_worker_errors(camera_id, process):
-    stream = getattr(process, "stderr", None)
-    if stream is None:
-        return
-    try:
-        for line in stream:
-            with WORKER_LOCK:
-                entry = PUBLIC_WORKERS.get(camera_id)
-                if not entry or entry.get("process") is not process:
-                    return
-                entry["errors"].append(re.sub(r"\s+", " ", line).strip())
-    except (OSError, ValueError):
-        return
-
-
-def start_public_worker(camera_id, camera):
-    process = subprocess.Popen(public_worker_command(camera), stdout=subprocess.DEVNULL,
-                               stderr=subprocess.PIPE, text=True, close_fds=True)
-    PUBLIC_WORKERS[camera_id] = {"process": process, "signature": worker_signature(camera),
-                                 "started": time.monotonic(), "errors": deque(maxlen=20)}
-    threading.Thread(target=capture_worker_errors, args=(camera_id, process), daemon=True).start()
-    RUNTIME.setdefault(camera_id, {})["pipeline_pid"] = process.pid
-    return process
-
-
-def replace_public_worker(camera_id, camera, verify=True):
-    with WORKER_LOCK:
-        stop_public_worker(camera_id)
-        process = start_public_worker(camera_id, camera)
-    if not verify:
-        return process
-    deadline, last_error = time.monotonic() + 20, None
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError(f"camera pipeline exited with status {process.returncode}")
-        try:
-            fetch_frame(slug(camera["name"]), timeout=4)
-            return process
-        except Exception as error:
-            last_error = error
-            time.sleep(1)
-    raise RuntimeError(f"replacement stream did not produce a frame: {last_error}")
-
-
-def supervise_workers_once():
-    cameras = load_state()
-    active = {camera_id: camera for camera_id, camera in cameras.items()
-              if camera_is_active(camera) and camera_id not in MODE_VALIDATION}
-    retest = []
-    with WORKER_LOCK:
-        for camera_id in list(PUBLIC_WORKERS):
-            if camera_id not in active:
-                stop_public_worker(camera_id)
-        for camera_id, camera in active.items():
-            entry = PUBLIC_WORKERS.get(camera_id)
-            if entry and entry["process"].poll() is None and entry["signature"] == worker_signature(camera):
-                continue
-            if entry:
-                runtime = RUNTIME.setdefault(camera_id, {})
-                now = time.monotonic()
-                failures = runtime.setdefault("worker_failures", deque(maxlen=10))
-                failures.append(now)
-                while failures and now - failures[0] > 60:
-                    failures.popleft()
-                error = "; ".join(value for value in entry.get("errors", ()) if value)[-1200:]
-                if error:
-                    runtime["worker_error"] = error
-                if (camera.get("kind") == "usb" and len(failures) >= 3 and
-                        now >= runtime.get("next_mode_retest", 0)):
-                    runtime["next_mode_retest"] = now + 300
-                    runtime["worker_retry_at"] = now + 60
-                    retest.append(camera_id)
-                stop_public_worker(camera_id)
-                if camera_id in retest:
-                    continue
-            runtime = RUNTIME.setdefault(camera_id, {})
-            if time.monotonic() < runtime.get("worker_retry_at", 0):
-                continue
-            try:
-                start_public_worker(camera_id, camera)
-                runtime.update({"worker_retry_at": time.monotonic() + 5, "worker_error": ""})
-            except Exception as error:
-                runtime.update({"worker_error": str(error), "worker_retry_at": time.monotonic() + 10})
-    for camera_id in retest:
-        MODE_VALIDATION.add(camera_id)
-        try:
-            scan(restart=True, force_ids={camera_id})
-        except Exception as error:
-            RUNTIME.setdefault(camera_id, {})["worker_error"] = f"automatic mode retest failed: {error}"
-        finally:
-            MODE_VALIDATION.discard(camera_id)
-
-
 def apply_stream_state(cameras, camera_id, target, reason, force=False):
     camera = cameras[camera_id]
     if not force and bool(camera.get("night_active")) == bool(target):
@@ -620,23 +516,25 @@ def apply_stream_state(cameras, camera_id, target, reason, force=False):
     camera["last_transition"] = int(time.time())
     camera["night_error"] = ""
     save_state(cameras)
-    write_config(cameras)
+    changed = write_config(cameras)
     runtime = RUNTIME.setdefault(camera_id, {})
     runtime.update({"status": "switching", "reason": reason, "dark_samples": 0, "bright_samples": 0, "extreme_samples": 0})
-    try:
-        replace_public_worker(camera_id, camera)
+    if not changed:
         runtime["status"] = "night" if target else "day"
         return True
-    except Exception as error:
-        camera["night_error"] = f"live switch failed: {error}; Frigate restart requested"
+    camera["night_error"] = "Frigate restart required to apply camera profile"
+    save_state(cameras)
+    if restart_frigate():
+        runtime["status"] = "restarting"
+        runtime["pipeline_error"] = ""
+        camera["night_error"] = ""
         save_state(cameras)
-        runtime["status"] = "fallback_restart"
-        if restart_frigate():
-            return True
-        camera["night_error"] += " but restart failed"
-        save_state(cameras)
-        runtime["status"] = "error"
-        return False
+        return True
+    camera["night_error"] += " but restart request failed"
+    runtime["status"] = "error"
+    runtime["pipeline_error"] = camera["night_error"]
+    save_state(cameras)
+    return False
 
 
 def selected_mode_is_available(camera):
@@ -657,6 +555,7 @@ def verify_usb_camera(camera, force=False, validator=validate_usb_mode):
         return False
     current_hash = camera.get("capabilities_hash", "")
     if (not force and camera.get("validation_status") == "verified" and
+            camera.get("mode_validation_version") == MODE_VALIDATION_VERSION and
             camera.get("validated_capabilities_hash") == current_hash and
             selected_mode_is_available(camera)):
         apply_selected_mode(camera, camera["selected_mode"])
@@ -670,6 +569,7 @@ def verify_usb_camera(camera, force=False, validator=validate_usb_mode):
                                                 camera.get("usb_attributes"), validator=validator)
         camera["last_mode_validation"] = int(time.time())
         camera["validated_capabilities_hash"] = current_hash
+        camera["mode_validation_version"] = MODE_VALIDATION_VERSION
         if selected:
             apply_selected_mode(camera, selected)
             camera["validation_status"] = "verified"
@@ -858,11 +758,24 @@ class Handler(BaseHTTPRequestHandler):
                         self.reply(400, {"error": "Only USB camera modes can be retested"})
                         return
                     MODE_VALIDATION.add(camera_id)
-                    stop_public_worker(camera_id)
-                time.sleep(1)
+                    camera["status"] = "validating"
+                    save_state(cameras)
+                    write_config(cameras)
+                if not restart_frigate():
+                    raise RuntimeError("Frigate could not release the camera for mode testing")
+                if not wait_camera_released(camera):
+                    raise RuntimeError("Frigate did not release the camera before mode testing")
                 cameras = scan(restart=True, force_ids={camera_id})
                 self.reply(200, public_state({camera_id: cameras[camera_id]})[camera_id])
             except Exception as error:
+                with LOCK:
+                    cameras = load_state()
+                    camera = cameras.get(camera_id)
+                    if camera and camera.get("status") == "validating":
+                        camera["status"] = "available" if camera.get("selected_mode") else "unhealthy"
+                        save_state(cameras)
+                        if write_config(cameras):
+                            restart_frigate()
                 self.reply(400, {"error": str(error)})
             finally:
                 MODE_VALIDATION.discard(camera_id)
@@ -921,20 +834,10 @@ def monitor_loop():
             print(f"night monitor failed: {error}", flush=True)
 
 
-def worker_loop():
-    while True:
-        try:
-            supervise_workers_once()
-        except Exception as error:
-            print(f"camera pipeline supervisor failed: {error}", flush=True)
-        time.sleep(2)
-
-
 def main():
     scan(restart=True)
     threading.Thread(target=scan_loop, daemon=True).start()
     threading.Thread(target=monitor_loop, daemon=True).start()
-    threading.Thread(target=worker_loop, daemon=True).start()
     ThreadingHTTPServer(("0.0.0.0", 8971), Handler).serve_forever()
 
 

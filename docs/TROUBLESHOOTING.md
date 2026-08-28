@@ -58,7 +58,7 @@ docker compose logs -f frigate
 
 Open `http://YOUR-CASAOS-IP:8971` and check each camera's Light, Active profile, and Monitor fields. Auto enters Night after six readings at or below the dark threshold and returns to Day after three readings at or above the bright threshold. Test immediately by selecting forced Night and then forced Day.
 
-If the monitor reports `sample_error`, `fallback_restart`, or a reconnecting pipeline, inspect both services:
+If the monitor reports `sample_error`, `error`, or a reconnecting pipeline, inspect both services:
 
 ```bash
 docker compose logs --since=5m camera-manager frigate
