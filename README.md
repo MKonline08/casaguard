@@ -38,7 +38,7 @@
 On your CasaOS host, clone this repository and run:
 
 ```bash
-git clone https://github.com/YOUR-ACCOUNT/casaguard.git
+git clone https://github.com/MKonline08/casaguard.git
 cd casaguard
 chmod +x scripts/*.sh && ./scripts/install.sh
 ```
@@ -48,7 +48,7 @@ Open `http://YOUR-CASAOS-IP:8971` to review discovered cameras and their Auto/Da
 ### Quick start — three commands
 
 ```bash
-git clone https://github.com/YOUR-ACCOUNT/casaguard.git && cd casaguard
+git clone https://github.com/MKonline08/casaguard.git && cd casaguard
 cp .env.example .env
 ./scripts/install.sh
 ```

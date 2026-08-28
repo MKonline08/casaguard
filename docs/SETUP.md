@@ -28,7 +28,7 @@ The generated Frigate configuration is stored in the `casaguard_frigate_config` 
 ## Option B — recommended one-command install
 
 ```bash
-git clone https://github.com/YOUR-ACCOUNT/casaguard.git
+git clone https://github.com/MKonline08/casaguard.git
 cd casaguard
 cp .env.example .env
 chmod +x scripts/*.sh
