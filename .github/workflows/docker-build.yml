@@ -1,6 +1,9 @@
 name: Publish CasaGuard images
 
 on:
+  push:
+    branches: [main]
+  pull_request:
   release:
     types: [published]
   workflow_dispatch:
@@ -10,7 +13,18 @@ permissions:
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Compose configuration
+        run: docker compose config --quiet
+      - name: Build and test camera manager
+        run: docker build --tag casaguard-camera-manager:test camera-manager
+
   publish:
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    needs: test
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
