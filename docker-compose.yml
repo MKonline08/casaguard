@@ -59,7 +59,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-      start_period: 10s
+      start_period: 180s # Allows bounded V4L2 decode validation before the API starts
     security_opt:
       - no-new-privileges:true
 

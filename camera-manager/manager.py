@@ -105,7 +105,7 @@ def capabilities_hash(modes):
     return hashlib.sha256(json.dumps(normalized).encode()).hexdigest()[:16]
 
 
-def ranked_modes(modes, attributes=None, limit=16):
+def ranked_modes(modes, attributes=None, limit=8):
     attributes = attributes or {}
     maximum = KNOWN_USB_LIMITS.get((attributes.get("vendor"), attributes.get("product")))
     filtered = [dict(mode) for mode in modes if not maximum or
@@ -135,7 +135,7 @@ def ffmpeg_input_format(value):
             "nv12": "nv12"}.get(value, value)
 
 
-def validate_usb_mode(path, mode, timeout=8):
+def validate_usb_mode(path, mode, timeout=5):
     frames = max(8, min(45, round(float(mode["fps"]) * 1.5)))
     command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-xerror", "-nostdin",
                "-f", "v4l2", "-input_format", ffmpeg_input_format(mode["input_format"]),
