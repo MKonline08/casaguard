@@ -4,6 +4,6 @@ rtsp:
   listen: "127.0.0.1:8554"
 streams:
   test_day:
-    - "ffmpeg:/tmp/casaguard-test.mp4#input=-stream_loop -1 -re -i {input}#video=h264"
+    - "ffmpeg:/tmp/casaguard-test.mp4#video=h264"
   test_night:
-    - "ffmpeg:/tmp/casaguard-test.mp4#input=-stream_loop -1 -re -i {input}#video=h264#raw=-vf eq=brightness=0.08:contrast=1.12:gamma=1.75:saturation=0.90"
+    - "ffmpeg:/tmp/casaguard-test.mp4#video=h264#raw=-vf eq=brightness=0.08:contrast=1.12:gamma=1.75:saturation=0.90"
