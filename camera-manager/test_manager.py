@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import subprocess
 import shutil
@@ -13,16 +14,19 @@ from manager import (
     apply_stream_state,
     best_mode,
     capabilities_hash,
+    check_pipeline_health,
     evaluate_light,
     is_capture_node,
     jpeg_luminance,
     merge_usb_state,
     monitor_once,
+    mode_tuple,
     parse_modes,
     parse_v4l2_groups,
     public_state,
     camera_stream_source,
     ranked_modes,
+    recover_usb_pipeline,
     render,
     sample_luminance,
     select_verified_mode,
@@ -93,6 +97,20 @@ class NativeModeTests(unittest.TestCase):
         self.assertEqual("mjpeg", attempts[0][3])
         self.assertIn("Fallback from 1280x720@30 mjpeg", reason)
 
+    def test_lower_mjpeg_modes_are_tried_before_raw_yuyv(self):
+        attempts = []
+
+        def validator(_, mode):
+            attempts.append((mode["width"], mode["height"], mode["fps"], mode["input_format"]))
+            return mode["input_format"] == "yuyv422", "decode failed"
+
+        select_verified_mode(
+            "/dev/video0", parse_modes(self.MODES), {"vendor": "046d", "product": "0825"}, validator)
+        formats = [mode[3] for mode in attempts]
+        first_raw = formats.index("yuyv422")
+        self.assertTrue(all(value == "mjpeg" for value in formats[:first_raw]))
+        self.assertGreaterEqual(first_raw, 2)
+
     def test_verified_mode_is_persisted_without_retesting(self):
         modes = parse_modes(self.MODES)
         selected = {"width": 1280, "height": 720, "fps": 30.0, "input_format": "mjpeg"}
@@ -125,6 +143,33 @@ class NativeModeTests(unittest.TestCase):
         self.assertEqual("unhealthy", value["status"])
         self.assertEqual("failed", value["validation_status"])
         self.assertIn("cameras: {}", render({"usb_bad": value}))
+
+    def test_unchanged_failed_camera_is_not_retested_in_a_loop(self):
+        modes = parse_modes(self.MODES)
+        digest = capabilities_hash(modes)
+        value = camera(
+            id="usb_bad", kind="usb", available_modes=modes, capabilities_hash=digest,
+            validated_capabilities_hash=digest, validation_status="failed",
+            mode_validation_version=MODE_VALIDATION_VERSION, fallback_reason="all modes failed")
+        validator = Mock(side_effect=AssertionError("failed camera should wait for manual retest"))
+        self.assertFalse(verify_usb_camera(value, validator=validator))
+        validator.assert_not_called()
+        self.assertEqual("unhealthy", value["status"])
+
+    def test_runtime_downgrade_starts_after_current_mode(self):
+        modes = parse_modes(self.MODES)
+        current = {"width": 1280, "height": 720, "fps": 30.0, "input_format": "mjpeg"}
+        attempts = []
+
+        def validator(_, mode):
+            attempts.append(mode_tuple(mode))
+            return True, ""
+
+        selected, _ = select_verified_mode(
+            "/dev/video0", modes, {"vendor": "046d", "product": "0825"}, validator,
+            start_after=current)
+        self.assertNotEqual(mode_tuple(current), attempts[0])
+        self.assertEqual(mode_tuple(selected), attempts[0])
 
     def test_fps_is_selected_from_native_resolution(self):
         modes = """
@@ -338,8 +383,80 @@ class IdentityAndMigrationTests(unittest.TestCase):
 
 class ApiAndRecoveryTests(unittest.TestCase):
     def test_credentials_are_redacted_from_api_state(self):
-        state = public_state({"front": {"path": "rtsp://admin:secret@192.168.1.20/live"}})
+        with patch("manager.urllib.request.urlopen", side_effect=OSError("offline")):
+            state = public_state({"front": {"path": "rtsp://admin:secret@192.168.1.20/live"}})
         self.assertEqual("rtsp://***:***@192.168.1.20/live", state["front"]["path"])
+
+    @patch("manager.urllib.request.urlopen")
+    def test_configured_stream_without_frames_is_not_reported_running(self, open_url):
+        open_url.side_effect = [
+            io.StringIO('{"video0":{"producers":[{}],"consumers":[{}]}}'),
+            io.StringIO('{"cameras":{"video0":{"camera_fps":0}}}'),
+        ]
+        state = public_state({"video0": camera()})
+        self.assertFalse(state["video0"]["pipeline_running"])
+        self.assertEqual(0, state["video0"]["camera_fps"])
+
+    @patch("manager.urllib.request.urlopen")
+    def test_active_producer_with_frames_is_reported_running(self, open_url):
+        open_url.side_effect = [
+            io.StringIO('{"video0":{"producers":[{}],"consumers":[{}]}}'),
+            io.StringIO('{"cameras":{"video0":{"camera_fps":4.8}}}'),
+        ]
+        self.assertTrue(public_state({"video0": camera()})["video0"]["pipeline_running"])
+
+    @patch("manager.recover_usb_pipeline")
+    @patch("manager.load_state")
+    def test_three_zero_frame_checks_recover_only_failed_camera(self, load, recover):
+        load.return_value = {
+            "bad": camera(id="bad", name="bad"),
+            "good": camera(id="good", name="good", path="/dev/video2"),
+        }
+        stats = {"bad": {"camera_fps": 0}, "good": {"camera_fps": 5}}
+        self.assertIsNone(check_pipeline_health(stats, now=1000))
+        self.assertIsNone(check_pipeline_health(stats, now=1030))
+        self.assertEqual("bad", check_pipeline_health(stats, now=1060))
+        recover.assert_called_once_with("bad", "No camera frames for 3 checks")
+        self.assertEqual(0, RUNTIME["good"]["pipeline_failures"])
+
+    @patch("manager.recover_usb_pipeline")
+    @patch("manager.load_state")
+    def test_recovery_cooldown_prevents_restart_loop(self, load, recover):
+        load.return_value = {"bad": camera(id="bad", name="bad", last_recovery=900)}
+        for now in (1000, 1030, 1060, 1090):
+            check_pipeline_health({"bad": {"camera_fps": 0}}, now=now)
+        recover.assert_not_called()
+
+    @patch("manager.wait_camera_released", return_value=True)
+    @patch("manager.restart_frigate", return_value=True)
+    @patch("manager.write_config", return_value=True)
+    @patch("manager.save_state")
+    @patch("manager.load_state")
+    def test_pipeline_recovery_downgrades_only_affected_camera(
+            self, load, save, _, restart, wait):
+        modes = parse_modes(NativeModeTests.MODES)
+        selected = {"width": 1280, "height": 720, "fps": 30.0, "input_format": "mjpeg"}
+        state = {
+            "bad": camera(id="bad", name="bad", available_modes=modes, selected_mode=selected,
+                          usb_attributes={"vendor": "046d", "product": "0825"}),
+            "good": camera(id="good", name="good", path="/dev/video2", width=1920, height=1080),
+        }
+
+        def load_copy():
+            return json.loads(json.dumps(state))
+
+        def store(value):
+            state.clear()
+            state.update(json.loads(json.dumps(value)))
+
+        load.side_effect = load_copy
+        save.side_effect = store
+        self.assertTrue(recover_usb_pipeline("bad", "three failed checks", validator=lambda *_: (True, "")))
+        self.assertEqual((640, 480, 30.0, "mjpeg"), mode_tuple(state["bad"]["selected_mode"]))
+        self.assertEqual((1920, 1080), (state["good"]["width"], state["good"]["height"]))
+        self.assertIn("Automatic downgrade", state["bad"]["fallback_reason"])
+        self.assertEqual(2, restart.call_count)
+        wait.assert_called_once()
 
     def tearDown(self):
         RUNTIME.clear()

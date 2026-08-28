@@ -85,6 +85,8 @@ Every camera defaults to **Auto / Aggressive**. CasaGuard samples the camera's m
 
 Use the camera-manager page on port `8971` to force Day or Night, select Gentle/Balanced/Aggressive enhancement, or tune the per-camera thresholds. The filter never changes the selected resolution or live FPS. Public streams are normal go2rtc-managed FFmpeg sources and exist as soon as Frigate loads its configuration; profile changes use a controlled Frigate reload so cameras cannot be lost to a startup race.
 
+CasaGuard also checks the actual Frigate camera FPS instead of treating a configured stream name as proof that video is running. Three consecutive zero-frame checks trigger a one-camera mode downgrade. Recovery has a ten-minute cooldown, so a damaged or disconnected camera cannot put Frigate into a restart loop or repeatedly disturb healthy cameras.
+
 USB cameras are decode-tested before Frigate uses them. CasaGuard starts with the highest advertised mode allowed for the detected hardware, explicitly rejects malformed decoder output even when FFmpeg exits successfully, and falls back to the highest mode that produces clean frames. The verified choice is versioned and saved by stable camera identity, so decoder fixes cause one safe recheck while routine rescans do not interrupt a healthy feed. The camera-manager page shows the active format, resolution, validation status, and any fallback reason; **Retest modes** temporarily removes that camera from Frigate, validates it while the device is released, and restores it with a controlled reload.
 
 ## Storage and backup

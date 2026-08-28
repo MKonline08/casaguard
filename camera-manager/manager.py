@@ -25,7 +25,9 @@ LIGHT_SCAN_SECONDS = max(5, int(os.getenv("LIGHT_SCAN_SECONDS", "10")))
 LOCK = threading.RLock()
 RUNTIME = {}
 MODE_VALIDATION = set()
-MODE_VALIDATION_VERSION = 2
+MODE_VALIDATION_VERSION = 3
+PIPELINE_FAILURE_LIMIT = 3
+PIPELINE_RECOVERY_COOLDOWN = 600
 
 FORMATS = {"H264": "h264", "MJPG": "mjpeg", "JPEG": "mjpeg", "HEVC": "hevc", "YUYV": "yuyv422", "NV12": "nv12"}
 PRIORITY = {"h264": 4, "mjpeg": 3, "hevc": 2, "nv12": 1, "yuyv422": 0}
@@ -42,6 +44,7 @@ PRESERVED_FIELDS = (
     "name", "enabled", "night_mode", "night_strength", "dark_threshold", "bright_threshold",
     "night_active", "last_transition", "night_error", "selected_mode", "validation_status",
     "fallback_reason", "last_mode_validation", "validated_capabilities_hash", "mode_validation_version",
+    "last_recovery",
 )
 
 KNOWN_USB_LIMITS = {
@@ -104,7 +107,7 @@ def capabilities_hash(modes):
     return hashlib.sha256(json.dumps(normalized).encode()).hexdigest()[:16]
 
 
-def ranked_modes(modes, attributes=None, limit=8):
+def ranked_modes(modes, attributes=None, limit=16):
     attributes = attributes or {}
     maximum = KNOWN_USB_LIMITS.get((attributes.get("vendor"), attributes.get("product")))
     filtered = [dict(mode) for mode in modes if not maximum or
@@ -118,15 +121,14 @@ def ranked_modes(modes, attributes=None, limit=8):
         values.sort(key=lambda mode: (mode["width"] * mode["height"], mode["fps"]), reverse=True)
     ordered = []
     formats = sorted(by_format, key=lambda value: PRIORITY.get(value, -1), reverse=True)
-    depth = 0
-    while len(ordered) < limit and any(depth < len(by_format[value]) for value in formats):
-        for value in formats:
-            if depth < len(by_format[value]):
-                ordered.append(by_format[value][depth])
-                if len(ordered) >= limit:
-                    break
-        depth += 1
-    return ordered
+    # Exhaust compressed choices before raw formats. A lower MJPEG mode normally consumes much
+    # less USB bandwidth than a large YUYV mode and is the safer fallback for UVC cameras that
+    # over-advertise their highest MJPEG mode.
+    for value in formats:
+        ordered.extend(by_format[value])
+        if len(ordered) >= limit:
+            break
+    return ordered[:limit]
 
 
 def ffmpeg_input_format(value):
@@ -149,7 +151,8 @@ def validate_usb_mode(path, mode, timeout=5):
     error = re.sub(r"\s+", " ", result.stderr or "").strip()[-600:]
     corrupt = re.search(
         r"unable to decode APP fields|Invalid data found when processing input|corrupt(?:ed)?|"
-        r"error while decoding|overread|No space left on device|Input/output error",
+        r"error while decoding|overread|EOI missing|No JPEG data found|"
+        r"No space left on device|Input/output error",
         result.stderr or "", re.IGNORECASE,
     )
     if result.returncode or corrupt:
@@ -157,8 +160,14 @@ def validate_usb_mode(path, mode, timeout=5):
     return True, ""
 
 
-def select_verified_mode(path, modes, attributes=None, validator=validate_usb_mode):
+def select_verified_mode(path, modes, attributes=None, validator=validate_usb_mode, start_after=None):
     candidates = ranked_modes(modes, attributes)
+    if start_after:
+        previous = mode_tuple(start_after)
+        index = next((index for index, mode in enumerate(candidates)
+                      if mode_tuple(mode) == previous), None)
+        candidates = candidates[index + 1:] if index is not None else [
+            mode for mode in candidates if mode_tuple(mode) != previous]
     errors = []
     for index, mode in enumerate(candidates):
         valid, error = validator(path, mode)
@@ -338,6 +347,7 @@ def public_state(cameras):
             streams = json.load(response)
     except Exception:
         streams = {}
+    frigate_cameras = fetch_frigate_camera_stats() or {}
     for camera_id, camera in safe.items():
         camera["path"] = re.sub(r"(?<=://)[^/@]+@", "***:***@", camera.get("path", ""))
         for private in ("stable_hardware_id", "usb_attributes", "available_modes", "capabilities_hash",
@@ -349,8 +359,23 @@ def public_state(cameras):
         camera["last_sample"] = runtime.get("last_sample", 0)
         camera["monitor_error"] = runtime.get("error", "")
         camera["pipeline_error"] = runtime.get("pipeline_error", "")
-        camera["pipeline_running"] = slug(camera.get("name", camera_id)) in streams
+        name = slug(camera.get("name", camera_id))
+        stream = streams.get(name, {})
+        has_producer = isinstance(stream, dict) and bool(stream.get("producers"))
+        stats = frigate_cameras.get(name, {})
+        camera_fps = float(stats.get("camera_fps") or 0) if isinstance(stats, dict) else 0
+        camera["pipeline_running"] = bool(has_producer and camera_fps > 0)
+        camera["camera_fps"] = camera_fps
     return safe
+
+
+def fetch_frigate_camera_stats():
+    try:
+        with urllib.request.urlopen(f"{FRIGATE_URL}/api/stats", timeout=2) as response:
+            data = json.load(response)
+        return data.get("cameras", {}) if isinstance(data, dict) else {}
+    except Exception:
+        return None
 
 
 def camera_is_active(camera):
@@ -537,10 +562,15 @@ def apply_selected_mode(camera, selected):
     camera["width"], camera["height"], camera["fps"], camera["input_format"] = mode_tuple(selected)
 
 
-def verify_usb_camera(camera, force=False, validator=validate_usb_mode):
+def verify_usb_camera(camera, force=False, validator=validate_usb_mode, downgrade=False):
     if camera.get("kind") != "usb" or camera.get("status") == "offline":
         return False
     current_hash = camera.get("capabilities_hash", "")
+    if (not force and camera.get("validation_status") == "failed" and
+            camera.get("mode_validation_version") == MODE_VALIDATION_VERSION and
+            camera.get("validated_capabilities_hash") == current_hash):
+        camera["status"] = "unhealthy"
+        return False
     if (not force and camera.get("validation_status") == "verified" and
             camera.get("mode_validation_version") == MODE_VALIDATION_VERSION and
             camera.get("validated_capabilities_hash") == current_hash and
@@ -552,8 +582,10 @@ def verify_usb_camera(camera, force=False, validator=validate_usb_mode):
     MODE_VALIDATION.add(camera_id)
     camera["validation_status"] = "validating"
     try:
-        selected, reason = select_verified_mode(camera["path"], camera.get("available_modes", []),
-                                                camera.get("usb_attributes"), validator=validator)
+        previous = camera.get("selected_mode") if downgrade else None
+        selected, reason = select_verified_mode(
+            camera["path"], camera.get("available_modes", []), camera.get("usb_attributes"),
+            validator=validator, start_after=previous)
         camera["last_mode_validation"] = int(time.time())
         camera["validated_capabilities_hash"] = current_hash
         camera["mode_validation_version"] = MODE_VALIDATION_VERSION
@@ -627,6 +659,93 @@ def scan(restart=True, force_ids=None):
     return cameras
 
 
+def recover_usb_pipeline(camera_id, reason="repeated zero-frame checks", validator=validate_usb_mode):
+    """Release and downgrade one failed USB camera without repeatedly cycling the stack."""
+    with LOCK:
+        cameras = load_state()
+        camera = cameras.get(camera_id)
+        if not camera or camera.get("kind") != "usb" or not camera_is_active(camera):
+            return False
+        previous = dict(camera.get("selected_mode") or {})
+        runtime = RUNTIME.setdefault(camera_id, {})
+        runtime.update({"last_recovery": int(time.time()), "pipeline_error": reason,
+                        "pipeline_failures": 0, "status": "recovering"})
+        camera["last_recovery"] = runtime["last_recovery"]
+        camera["status"] = "validating"
+        save_state(cameras)
+        write_config(cameras)
+    if not restart_frigate() or not wait_camera_released(camera):
+        with LOCK:
+            cameras = load_state()
+            if camera_id in cameras:
+                cameras[camera_id]["status"] = "available"
+                cameras[camera_id]["fallback_reason"] = f"Recovery could not release camera: {reason}"
+                save_state(cameras)
+                changed = write_config(cameras)
+            else:
+                changed = False
+        if changed:
+            restart_frigate()
+        runtime["status"] = "recovery_error"
+        return False
+    with LOCK:
+        cameras = load_state()
+        camera = cameras.get(camera_id)
+        if not camera:
+            return False
+        verify_usb_camera(camera, force=True, validator=validator, downgrade=True)
+        if camera.get("validation_status") == "verified":
+            old = (f'{previous.get("width", "?")}x{previous.get("height", "?")}@'
+                   f'{previous.get("fps", "?")} {previous.get("input_format", "?")}')
+            new = (f'{camera.get("width")}x{camera.get("height")}@'
+                   f'{camera.get("fps"):g} {camera.get("input_format")}')
+            camera["fallback_reason"] = f"Automatic downgrade from {old} to {new}: {reason}"
+        else:
+            camera["fallback_reason"] = f"Automatic recovery failed: {reason}; {camera.get('fallback_reason', '')}"
+        camera["last_recovery"] = runtime["last_recovery"]
+        save_state(cameras)
+        changed = write_config(cameras)
+    if changed:
+        restart_frigate()
+    runtime["status"] = "restarting" if camera.get("status") == "available" else "unhealthy"
+    runtime["pipeline_error"] = camera.get("fallback_reason", reason)
+    return camera.get("status") == "available"
+
+
+def check_pipeline_health(stats=None, now=None):
+    """Debounce zero-frame failures and recover at most one USB camera per scan."""
+    stats = fetch_frigate_camera_stats() if stats is None else stats
+    if stats is None:
+        return None
+    now = time.time() if now is None else now
+    with LOCK:
+        cameras = load_state()
+        for camera_id, camera in cameras.items():
+            if camera.get("kind") != "usb" or not camera_is_active(camera) or camera_id in MODE_VALIDATION:
+                continue
+            name = slug(camera.get("name", camera_id))
+            details = stats.get(name, {}) if isinstance(stats, dict) else {}
+            fps = float(details.get("camera_fps") or 0) if isinstance(details, dict) else 0
+            runtime = RUNTIME.setdefault(camera_id, {})
+            if fps > 0:
+                runtime["pipeline_failures"] = 0
+                runtime["pipeline_error"] = ""
+                continue
+            runtime["pipeline_failures"] = int(runtime.get("pipeline_failures", 0)) + 1
+            runtime["pipeline_error"] = f'No camera frames for {runtime["pipeline_failures"]} checks'
+            last_recovery = max(float(runtime.get("last_recovery", 0)),
+                                float(camera.get("last_recovery", 0)))
+            if (runtime["pipeline_failures"] >= PIPELINE_FAILURE_LIMIT and
+                    now - last_recovery >= PIPELINE_RECOVERY_COOLDOWN):
+                target = camera_id
+                reason = runtime["pipeline_error"]
+                break
+        else:
+            return None
+    recover_usb_pipeline(target, reason)
+    return target
+
+
 def monitor_once():
     with LOCK:
         cameras = load_state()
@@ -658,7 +777,7 @@ INDEX = r'''<!doctype html><meta charset="utf-8"><meta name="viewport" content="
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function patchCamera(id,body){let r=await fetch('/api/cameras/'+encodeURIComponent(id),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)alert((await r.json()).error);await load()}
 async function retest(id){if(!confirm('Retest this camera? Its feed will reconnect briefly.'))return;let r=await fetch('/api/cameras/'+encodeURIComponent(id)+'/retest',{method:'POST'});if(!r.ok)alert((await r.json()).error);await load()}
-async function load(){let c=await fetch('/api/cameras').then(r=>r.json());list.innerHTML=Object.values(c).map(x=>`<article><b>${esc(x.name)}</b> <span class="${x.status==='available'||x.status==='configured'?'ok':'bad'}">${esc(x.status)}</span><div class="meta">${esc(x.kind)} · ${esc(x.width||'?')}×${esc(x.height||'?')} @ ${esc(x.fps||'?')} fps · ${esc(x.input_format||'')}<br>Mode validation: <span class="${x.validation_status==='verified'||x.kind!=='usb'?'ok':'bad'}">${esc(x.validation_status||'not required')}</span>${x.last_mode_validation?' · '+new Date(x.last_mode_validation*1000).toLocaleString():''}${x.fallback_reason?'<br><span class="bad">'+esc(x.fallback_reason)+'</span>':''}<br>Light: ${x.luminance??'waiting'} / 255 · Active profile: <b>${x.night_active?'Night':'Day'}</b> · Monitor: ${esc(x.night_status)} · Pipeline: <span class="${x.pipeline_running?'ok':'bad'}">${x.pipeline_running?'running':'reconnecting'}</span>${x.last_transition?'<br>Last switch: '+new Date(x.last_transition*1000).toLocaleString():''}${x.night_error?'<br><span class="bad">'+esc(x.night_error)+'</span>':''}${x.monitor_error?'<br><span class="bad">Monitor: '+esc(x.monitor_error)+'</span>':''}${x.pipeline_error?'<br><span class="bad">Pipeline: '+esc(x.pipeline_error)+'</span>':''}</div><div class="controls"><label>Mode <select onchange="patchCamera('${esc(x.id)}',{night_mode:this.value})"><option value="auto" ${x.night_mode==='auto'?'selected':''}>Auto</option><option value="day" ${x.night_mode==='day'?'selected':''}>Day</option><option value="night" ${x.night_mode==='night'?'selected':''}>Night</option></select></label><label>Strength <select onchange="patchCamera('${esc(x.id)}',{night_strength:this.value})"><option value="gentle" ${x.night_strength==='gentle'?'selected':''}>Gentle</option><option value="balanced" ${x.night_strength==='balanced'?'selected':''}>Balanced</option><option value="aggressive" ${x.night_strength==='aggressive'?'selected':''}>Aggressive</option></select></label><label>Dark ≤ <input type="number" min="0" max="255" value="${esc(x.dark_threshold)}" onchange="patchCamera('${esc(x.id)}',{dark_threshold:Number(this.value)})" size="4"></label><label>Bright ≥ <input type="number" min="0" max="255" value="${esc(x.bright_threshold)}" onchange="patchCamera('${esc(x.id)}',{bright_threshold:Number(this.value)})" size="4"></label>${x.kind==='usb'?'<button data-camera="'+esc(x.id)+'" onclick="retest(this.dataset.camera)">Retest modes</button>':''}</div></article>`).join('')}
+async function load(){let c=await fetch('/api/cameras').then(r=>r.json());list.innerHTML=Object.values(c).map(x=>`<article><b>${esc(x.name)}</b> <span class="${x.status==='available'||x.status==='configured'?'ok':'bad'}">${esc(x.status)}</span><div class="meta">${esc(x.kind)} · ${esc(x.width||'?')}×${esc(x.height||'?')} @ ${esc(x.fps||'?')} fps · ${esc(x.input_format||'')}<br>Mode validation: <span class="${x.validation_status==='verified'||x.kind!=='usb'?'ok':'bad'}">${esc(x.validation_status||'not required')}</span>${x.last_mode_validation?' · '+new Date(x.last_mode_validation*1000).toLocaleString():''}${x.fallback_reason?'<br><span class="bad">'+esc(x.fallback_reason)+'</span>':''}<br>Light: ${x.luminance??'waiting'} / 255 · Active profile: <b>${x.night_active?'Night':'Day'}</b> · Monitor: ${esc(x.night_status)} · Pipeline: <span class="${x.pipeline_running?'ok':'bad'}">${x.pipeline_running?'running':'reconnecting'}</span> · Camera FPS: ${esc(x.camera_fps??0)}${x.last_transition?'<br>Last switch: '+new Date(x.last_transition*1000).toLocaleString():''}${x.night_error?'<br><span class="bad">'+esc(x.night_error)+'</span>':''}${x.monitor_error?'<br><span class="bad">Monitor: '+esc(x.monitor_error)+'</span>':''}${x.pipeline_error?'<br><span class="bad">Pipeline: '+esc(x.pipeline_error)+'</span>':''}</div><div class="controls"><label>Mode <select onchange="patchCamera('${esc(x.id)}',{night_mode:this.value})"><option value="auto" ${x.night_mode==='auto'?'selected':''}>Auto</option><option value="day" ${x.night_mode==='day'?'selected':''}>Day</option><option value="night" ${x.night_mode==='night'?'selected':''}>Night</option></select></label><label>Strength <select onchange="patchCamera('${esc(x.id)}',{night_strength:this.value})"><option value="gentle" ${x.night_strength==='gentle'?'selected':''}>Gentle</option><option value="balanced" ${x.night_strength==='balanced'?'selected':''}>Balanced</option><option value="aggressive" ${x.night_strength==='aggressive'?'selected':''}>Aggressive</option></select></label><label>Dark ≤ <input type="number" min="0" max="255" value="${esc(x.dark_threshold)}" onchange="patchCamera('${esc(x.id)}',{dark_threshold:Number(this.value)})" size="4"></label><label>Bright ≥ <input type="number" min="0" max="255" value="${esc(x.bright_threshold)}" onchange="patchCamera('${esc(x.id)}',{bright_threshold:Number(this.value)})" size="4"></label>${x.kind==='usb'?'<button data-camera="'+esc(x.id)+'" onclick="retest(this.dataset.camera)">Retest modes</button>':''}</div></article>`).join('')}
 async function rescan(){await fetch('/api/rescan',{method:'POST'});load()}async function add(){let r=await fetch('/api/cameras',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name.value,path:url.value})});if(!r.ok)alert((await r.json()).error);load()}load();setInterval(load,10000);</script>'''.encode()
 
 
@@ -808,6 +927,7 @@ def scan_loop():
         time.sleep(SCAN_SECONDS)
         try:
             scan()
+            check_pipeline_health()
         except Exception as error:
             print(f"camera scan failed: {error}", flush=True)
 
