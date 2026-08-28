@@ -1,0 +1,11 @@
+api:
+  listen: "127.0.0.1:1984"
+rtsp:
+  listen: "127.0.0.1:8554"
+streams:
+  test_source:
+    - "ffmpeg:testsrc=size=320x240:rate=10#input=-f lavfi -i {input}#video=h264"
+  test_day:
+    - "ffmpeg:test_source#video=h264"
+  test_night:
+    - "ffmpeg:test_source#video=h264#raw=-vf eq=brightness=0.08:contrast=1.12:gamma=1.75:saturation=0.90"
