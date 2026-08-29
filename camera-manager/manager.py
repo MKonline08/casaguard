@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import os
 import re
 import socket
@@ -25,7 +26,7 @@ LIGHT_SCAN_SECONDS = max(5, int(os.getenv("LIGHT_SCAN_SECONDS", "10")))
 LOCK = threading.RLock()
 RUNTIME = {}
 MODE_VALIDATION = set()
-MODE_VALIDATION_VERSION = 3
+MODE_VALIDATION_VERSION = 4
 PIPELINE_FAILURE_LIMIT = 3
 PIPELINE_RECOVERY_COOLDOWN = 600
 
@@ -51,6 +52,41 @@ KNOWN_USB_LIMITS = {
     # Logitech C270. The device advertises 1280x960, but Logitech specifies 720p30.
     ("046d", "0825"): (1280, 720),
 }
+
+ANALYSIS_WIDTH = 32
+ANALYSIS_HEIGHT = 18
+ANALYSIS_FRAME_BYTES = ANALYSIS_WIDTH * ANALYSIS_HEIGHT * 3
+
+
+class GreenFrameError(ValueError):
+    """Raised when decoded video is the characteristic solid-green corruption frame."""
+
+
+def rgb_frame_is_corrupt_green(frame):
+    if len(frame) != ANALYSIS_FRAME_BYTES:
+        return False
+    pixels = len(frame) // 3
+    green_pixels = 0
+    red_total = green_total = blue_total = 0
+    for offset in range(0, len(frame), 3):
+        red, green, blue = frame[offset:offset + 3]
+        red_total += red
+        green_total += green
+        blue_total += blue
+        if green >= 70 and green >= red * 2 + 20 and green >= blue * 2 + 20:
+            green_pixels += 1
+    return (green_pixels / pixels >= 0.80 and green_total / pixels >= 70 and
+            red_total / pixels <= 45 and blue_total / pixels <= 45)
+
+
+def raw_video_has_green_corruption(payload):
+    frames = [payload[offset:offset + ANALYSIS_FRAME_BYTES]
+              for offset in range(0, len(payload or b""), ANALYSIS_FRAME_BYTES)]
+    frames = [frame for frame in frames if len(frame) == ANALYSIS_FRAME_BYTES]
+    if not frames:
+        return False
+    corrupt = sum(rgb_frame_is_corrupt_green(frame) for frame in frames)
+    return corrupt >= max(2, math.ceil(len(frames) / 2))
 
 
 def run(command, timeout=8):
@@ -142,20 +178,25 @@ def validate_usb_mode(path, mode, timeout=5):
                "-f", "v4l2", "-input_format", ffmpeg_input_format(mode["input_format"]),
                "-video_size", f'{int(mode["width"])}x{int(mode["height"])}',
                "-framerate", f'{float(mode["fps"]):g}', "-i", path,
-               "-frames:v", str(frames), "-f", "null", "-"]
+               "-vf", f"scale={ANALYSIS_WIDTH}:{ANALYSIS_HEIGHT}:flags=area,format=rgb24",
+               "-frames:v", str(frames), "-f", "rawvideo", "pipe:1"]
     try:
-        result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                text=True, timeout=timeout, check=False)
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=timeout, check=False)
     except subprocess.TimeoutExpired:
         return False, "validation timed out"
-    error = re.sub(r"\s+", " ", result.stderr or "").strip()[-600:]
+    stderr = result.stderr.decode(errors="replace") if isinstance(result.stderr, bytes) else (result.stderr or "")
+    error = re.sub(r"\s+", " ", stderr).strip()[-600:]
     corrupt = re.search(
         r"unable to decode APP fields|Invalid data found when processing input|corrupt(?:ed)?|"
         r"error while decoding|overread|EOI missing|No JPEG data found|"
         r"No space left on device|Input/output error",
-        result.stderr or "", re.IGNORECASE,
+        stderr, re.IGNORECASE,
     )
-    if result.returncode or corrupt:
+    green_corrupt = raw_video_has_green_corruption(result.stdout)
+    if result.returncode or corrupt or green_corrupt:
+        if green_corrupt:
+            error = "decoded frames are solid green (corrupt video mode)"
         return False, error or f"FFmpeg exited with status {result.returncode}"
     return True, ""
 
@@ -474,13 +515,20 @@ def fetch_frame(stream_name, timeout=10):
 
 def jpeg_luminance(payload):
     process = subprocess.run(
-        ["ffmpeg", "-v", "error", "-i", "pipe:0", "-vf", "scale=1:1:flags=area,format=gray",
+        ["ffmpeg", "-v", "error", "-i", "pipe:0", "-vf",
+         f"scale={ANALYSIS_WIDTH}:{ANALYSIS_HEIGHT}:flags=area,format=rgb24",
          "-frames:v", "1", "-f", "rawvideo", "pipe:1"], input=payload, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, timeout=8, check=True,
     )
-    if len(process.stdout) != 1:
+    if len(process.stdout) != ANALYSIS_FRAME_BYTES:
         raise ValueError("unable to calculate frame luminance")
-    return process.stdout[0]
+    if rgb_frame_is_corrupt_green(process.stdout):
+        raise GreenFrameError("solid-green corrupt video frame detected")
+    pixels = len(process.stdout) // 3
+    red = sum(process.stdout[0::3]) / pixels
+    green = sum(process.stdout[1::3]) / pixels
+    blue = sum(process.stdout[2::3]) / pixels
+    return round(0.2126 * red + 0.7152 * green + 0.0722 * blue)
 
 
 def sample_luminance(camera, attempts=3):
@@ -797,7 +845,8 @@ def monitor_once():
         runtime = RUNTIME.setdefault(camera_id, {})
         try:
             luminance = sample_luminance(camera)
-            runtime.update({"luminance": luminance, "last_sample": int(time.time()), "status": "monitoring", "error": ""})
+            runtime.update({"luminance": luminance, "last_sample": int(time.time()), "status": "monitoring",
+                            "error": "", "green_samples": 0})
             target = evaluate_light(camera, luminance, runtime)
             if target is not None:
                 with LOCK:
@@ -806,6 +855,17 @@ def monitor_once():
                         apply_stream_state(cameras, camera_id, target, "automatic light transition")
             elif runtime.get("status") == "monitoring":
                 runtime["status"] = "night" if camera.get("night_active") else "day"
+        except GreenFrameError as error:
+            now = time.time()
+            runtime["green_samples"] = int(runtime.get("green_samples", 0)) + 1
+            runtime.update({"status": "green_corruption", "last_sample": int(now), "error": str(error),
+                            "pipeline_error": f'Green corruption seen for {runtime["green_samples"]} checks'})
+            last_recovery = max(float(runtime.get("last_recovery", 0)),
+                                float(camera.get("last_recovery", 0)))
+            if (runtime["green_samples"] >= PIPELINE_FAILURE_LIMIT and
+                    now - last_recovery >= PIPELINE_RECOVERY_COOLDOWN):
+                runtime["green_samples"] = 0
+                recover_usb_pipeline(camera_id, "Repeated solid-green video frames")
         except Exception as error:
             runtime.update({"status": "sample_error", "last_sample": int(time.time()), "error": str(error)})
 

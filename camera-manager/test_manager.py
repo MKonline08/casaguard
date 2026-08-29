@@ -8,6 +8,8 @@ import unittest
 from unittest.mock import Mock, patch
 
 from manager import (
+    ANALYSIS_FRAME_BYTES,
+    GreenFrameError,
     NIGHT_FILTERS,
     MODE_VALIDATION_VERSION,
     RUNTIME,
@@ -29,6 +31,7 @@ from manager import (
     ranked_modes,
     recover_usb_pipeline,
     render,
+    rgb_frame_is_corrupt_green,
     sample_luminance,
     scan,
     select_verified_mode,
@@ -326,6 +329,20 @@ class LightEvaluationTests(unittest.TestCase):
         apply.assert_not_called()
         self.assertEqual("sample_error", RUNTIME["video0"]["status"])
 
+    @patch("manager.recover_usb_pipeline")
+    @patch("manager.sample_luminance", side_effect=[
+        GreenFrameError("solid green"), 50,
+        GreenFrameError("solid green"), 50,
+        GreenFrameError("solid green"), 50,
+    ])
+    @patch("manager.load_state")
+    def test_three_live_green_frames_downgrade_only_that_camera(self, load, _, recover):
+        load.return_value = {"video0": camera(), "video2": camera(id="video2", name="video2")}
+        for _ in range(3):
+            monitor_once()
+        recover.assert_called_once_with("video0", "Repeated solid-green video frames")
+        self.assertEqual(0, RUNTIME["video2"]["green_samples"])
+
 
 class LuminanceTests(unittest.TestCase):
     @staticmethod
@@ -339,6 +356,17 @@ class LuminanceTests(unittest.TestCase):
     def test_synthetic_dark_and_bright_frames(self):
         self.assertLess(jpeg_luminance(self.frame("black")), 30)
         self.assertGreater(jpeg_luminance(self.frame("white")), 220)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is required for the synthetic frame test")
+    def test_solid_green_camera_frame_is_rejected(self):
+        with self.assertRaises(GreenFrameError):
+            jpeg_luminance(self.frame("green"))
+
+    def test_green_detector_does_not_reject_normal_colored_frame(self):
+        corrupt = bytes([5, 110, 5]) * (ANALYSIS_FRAME_BYTES // 3)
+        normal = bytes([60, 110, 70]) * (ANALYSIS_FRAME_BYTES // 3)
+        self.assertTrue(rgb_frame_is_corrupt_green(corrupt))
+        self.assertFalse(rgb_frame_is_corrupt_green(normal))
 
     @patch("manager.time.sleep")
     @patch("manager.jpeg_luminance", side_effect=[RuntimeError("truncated"), 73])
@@ -525,6 +553,15 @@ class ApiAndRecoveryTests(unittest.TestCase):
             "width": 1280, "height": 720, "fps": 30, "input_format": "mjpeg"})
         self.assertFalse(valid)
         self.assertIn("Invalid data found", error)
+
+    @patch("manager.subprocess.run")
+    def test_zero_exit_solid_green_mode_is_rejected(self, run):
+        frame = bytes([5, 110, 5]) * (ANALYSIS_FRAME_BYTES // 3)
+        run.return_value = subprocess.CompletedProcess([], 0, stdout=frame * 4, stderr=b"")
+        valid, error = validate_usb_mode("/dev/video0", {
+            "width": 1280, "height": 720, "fps": 30, "input_format": "mjpeg"})
+        self.assertFalse(valid)
+        self.assertIn("solid green", error)
 
 
 class DiscoveryTests(unittest.TestCase):

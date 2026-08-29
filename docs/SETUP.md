@@ -89,6 +89,8 @@ CasaGuard also checks the actual Frigate camera FPS instead of treating a config
 
 USB cameras are decode-tested before Frigate uses them. CasaGuard starts with the highest advertised mode allowed for the detected hardware, explicitly rejects malformed decoder output even when FFmpeg exits successfully, and falls back to the highest mode that produces clean frames. The verified choice is versioned and saved by stable camera identity, so decoder fixes cause one safe recheck while routine rescans do not interrupt a healthy feed. The camera-manager page shows the active format, resolution, validation status, and any fallback reason; **Retest modes** temporarily removes that camera from Frigate, validates it while the device is released, and restores it with a controlled reload.
 
+Validation and live monitoring also inspect decoded pixel content. Predominantly solid-green frames are treated as stream corruption even when FFmpeg is still running and reporting normal FPS. Three consecutive live green samples downgrade only the affected camera, using the same ten-minute recovery cooldown.
+
 ## Storage and backup
 
 Docker named volumes hold durable data:
